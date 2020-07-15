@@ -2,6 +2,7 @@
 //! detection
 
 use std::path::Path;
+use crate::emulator::VmExit;
 use crate::primitive::Primitive;
 
 /// Block size used for resetting and tracking memory which has been modified
@@ -140,21 +141,28 @@ impl Mmu {
     }
 
     /// Write the bytes from `buf` into `addr`
-    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8])
+            -> Result<(), VmExit> {
         let perms =
-            self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())?)?;
+            self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())
+                .ok_or(VmExit::AddressIntegerOverflow)?)
+            .ok_or(VmExit::AddressMiss(addr, buf.len()))?;
 
         // Check permissions
         let mut has_raw = false;
-        if !perms.iter().all(|x| {
-            has_raw |= (x.0 & PERM_RAW) != 0;
-            (x.0 & PERM_WRITE) != 0
-        }) {
-            return None;
+        for (idx, &perm) in perms.iter().enumerate() {
+            // Accumulate if any permission has the raw bit set, this will
+            // allow us to bypass permission updates if no RAW is in use
+            has_raw |= (perm.0 & PERM_RAW) != 0;
+
+            if (perm.0 & PERM_WRITE) == 0 {
+                // Permission denied, return error
+                return Err(VmExit::WriteFault(VirtAddr(addr.0 + idx)));
+            }
         }
 
-        self.memory.get_mut(addr.0..addr.0.checked_add(buf.len())?)?
-            .copy_from_slice(buf);
+        // Copy the buffer into memory!
+        self.memory[addr.0..addr.0 + buf.len()].copy_from_slice(buf);
 
         // Compute dirty bit blocks
         let block_start = addr.0 / DIRTY_BLOCK_SIZE;
@@ -184,50 +192,75 @@ impl Mmu {
             });
         }
 
-        Some(())
+        Ok(())
+    }
+    
+    /// Return an immutable slice to memory at `addr` for `size` bytes that
+    /// has been validated to match all `exp_perms`
+    pub fn peek_perms(&self, addr: VirtAddr, size: usize,
+                      exp_perms: Perm) -> Result<&[u8], VmExit> {
+        let perms =
+            self.permissions.get(addr.0..addr.0.checked_add(size)
+                .ok_or(VmExit::AddressIntegerOverflow)?)
+            .ok_or(VmExit::AddressMiss(addr, size))?;
+
+        // Check permissions
+        for (idx, &perm) in perms.iter().enumerate() {
+            if (perm.0 & exp_perms.0) != exp_perms.0 {
+                return Err(VmExit::ReadFault(VirtAddr(addr.0 + idx)));
+            }
+        }
+
+        // Return a slice to the memory
+        Ok(&self.memory[addr.0..addr.0 + size])
     }
    
     /// Read the memory at `addr` into `buf`
     /// This function checks to see if all bits in `exp_perms` are set in the
     /// permission bytes. If this is zero, we ignore permissions entirely.
     pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8],
-                           exp_perms: Perm) -> Option<()> {
+                           exp_perms: Perm) -> Result<(), VmExit> {
         let perms =
-            self.permissions.get(addr.0..addr.0.checked_add(buf.len())?)?;
+            self.permissions.get(addr.0..addr.0.checked_add(buf.len())
+                .ok_or(VmExit::AddressIntegerOverflow)?)
+            .ok_or(VmExit::AddressMiss(addr, buf.len()))?;
 
         // Check permissions
-        if exp_perms.0 != 0 &&
-                !perms.iter().all(|x| (x.0 & exp_perms.0) == exp_perms.0) {
-            return None;
+        for (idx, &perm) in perms.iter().enumerate() {
+            if (perm.0 & exp_perms.0) != exp_perms.0 {
+                return Err(VmExit::ReadFault(VirtAddr(addr.0 + idx)));
+            }
         }
 
-        buf.copy_from_slice(
-            self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?);
-        Some(())
+        // Copy the memory
+        buf.copy_from_slice(&self.memory[addr.0..addr.0 + buf.len()]);
+
+        Ok(())
     }
-    
+
     /// Read the memory at `addr` into `buf`
-    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8])
+            -> Result<(), VmExit> {
         self.read_into_perms(addr, buf, Perm(PERM_READ))
     }
 
     /// Read a type `T` at `vaddr` expecting `perms`
     pub fn read_perms<T: Primitive>(&mut self, addr: VirtAddr,
-                                    exp_perms: Perm) -> Option<T> {
+                                    exp_perms: Perm) -> Result<T, VmExit> {
         let mut tmp = [0u8; 16];
         self.read_into_perms(addr, &mut tmp[..core::mem::size_of::<T>()],
             exp_perms)?;
-        Some(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
+        Ok(unsafe { core::ptr::read_unaligned(tmp.as_ptr() as *const T) })
     }
     
     /// Read a type `T` at `vaddr`
-    pub fn read<T: Primitive>(&mut self, addr: VirtAddr) -> Option<T> {
+    pub fn read<T: Primitive>(&mut self, addr: VirtAddr) -> Result<T, VmExit> {
         self.read_perms(addr, Perm(PERM_READ))
     }
     
     /// Write a `val` to `addr`
     pub fn write<T: Primitive>(&mut self, addr: VirtAddr,
-                               val: T) -> Option<()> {
+                               val: T) -> Result<(), VmExit> {
         let tmp = unsafe {
             core::slice::from_raw_parts(&val as *const T as *const u8,
                                         core::mem::size_of::<T>())
@@ -254,7 +287,7 @@ impl Mmu {
                 contents.get(
                     section.file_off..
                     section.file_off.checked_add(section.file_size)?)?
-                )?;
+                ).ok()?;
 
             // Write in any padding with zeros
             if section.mem_size > section.file_size {
@@ -262,7 +295,7 @@ impl Mmu {
                 self.write_from(
                     VirtAddr(section.virt_addr.0
                              .checked_add(section.file_size)?),
-                    &padding)?;
+                    &padding).ok()?;
             }
             
             // Demote permissions to originals

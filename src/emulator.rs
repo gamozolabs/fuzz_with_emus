@@ -148,6 +148,32 @@ pub struct Emulator {
     registers: [u64; 33],
 }
 
+#[derive(Clone, Copy, Debug)]
+/// Reasons why the VM exited
+pub enum VmExit {
+    /// The VM exited due to a syscall instruction
+    Syscall,
+
+    /// The VM exited cleanly as requested by the VM
+    Exit,
+
+    /// An integer overflow occured during a syscall due to bad supplied
+    /// arguments by the program
+    SyscallIntegerOverflow,
+
+    /// A read or write memory request overflowed the address size
+    AddressIntegerOverflow,
+
+    /// The address requested was not in bounds of the guest memory space
+    AddressMiss(VirtAddr, usize),
+
+    /// An read of `VirtAddr` failed due to missing permissions
+    ReadFault(VirtAddr),
+    
+    /// An write of `VirtAddr` failed due to missing permissions
+    WriteFault(VirtAddr),
+}
+
 /// 64-bit RISC-V registers
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -240,7 +266,7 @@ impl Emulator {
         }
     }
 
-    pub fn run(&mut self) -> Option<()> {
+    pub fn run(&mut self) -> Result<(), VmExit> {
         'next_inst: loop {
             // Get the current program counter
             let pc = self.reg(Register::Pc);
@@ -250,7 +276,7 @@ impl Emulator {
             // Extract the opcode from the instruction
             let opcode = inst & 0b1111111;
 
-            print!("Executing {:#x} {:b}\n", pc, opcode);
+            //print!("Executing {:#x} {:b}\n", pc, opcode);
 
             match opcode {
                 0b0110111 => {
@@ -630,7 +656,7 @@ impl Emulator {
                 0b1110011 => {
                     if inst == 0b00000000000000000000000001110011 {
                         // ECALL
-                        panic!("SYSCALL");
+                        return Err(VmExit::Syscall);
                     } else if inst == 0b00000000000100000000000001110011 {
                         // EBREAK
                     } else {
@@ -691,8 +717,6 @@ impl Emulator {
             // Update PC to the next instruction
             self.set_reg(Register::Pc, pc.wrapping_add(4));
         }
-
-        Some(())
     }
 }
 
