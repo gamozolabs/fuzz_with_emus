@@ -187,7 +187,7 @@ impl Mmu {
             perms.iter_mut().for_each(|x| {
                 if (x.0 & PERM_RAW) != 0 {
                     // Mark memory as readable
-                    *x = Perm(x.0 | PERM_READ);
+                    *x = Perm((x.0 | PERM_READ) & (!PERM_RAW));
                 }
             });
         }
