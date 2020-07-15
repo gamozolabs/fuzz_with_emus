@@ -266,12 +266,15 @@ impl Emulator {
         }
     }
 
-    pub fn run(&mut self) -> Result<(), VmExit> {
+    pub fn run(&mut self, instrs_execed: &mut u64) -> Result<(), VmExit> {
         'next_inst: loop {
             // Get the current program counter
             let pc = self.reg(Register::Pc);
             let inst: u32 = self.memory.read_perms(VirtAddr(pc as usize), 
                                                    Perm(PERM_EXEC))?;
+
+            // Update number of instructions executed
+            *instrs_execed += 1;
 
             // Extract the opcode from the instruction
             let opcode = inst & 0b1111111;
