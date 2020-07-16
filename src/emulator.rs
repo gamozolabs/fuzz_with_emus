@@ -3,6 +3,43 @@
 use std::fmt;
 use crate::mmu::{VirtAddr, Perm, Mmu, PERM_EXEC};
 
+#[cfg(target_os="windows")]
+pub fn alloc_rwx(size: usize) -> &'static mut [u8] {
+    extern {
+        fn VirtualAlloc(lpAddress: *const u8, dwSize: usize,
+                        flAllocationType: u32, flProtect: u32) -> *mut u8;
+    }
+
+    unsafe {
+        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+        const MEM_COMMIT:  u32 = 0x00001000;
+        const MEM_RESERVE: u32 = 0x00002000;
+
+        let ret = VirtualAlloc(0 as *const _, size, MEM_COMMIT | MEM_RESERVE,
+                               PAGE_EXECUTE_READWRITE);
+        assert!(!ret.is_null());
+
+        std::slice::from_raw_parts_mut(ret, size)
+    }
+}
+
+#[cfg(target_os="linux")]
+pub fn alloc_rwx(size: usize) -> &'static mut [u8] {
+    extern {
+        fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32,
+                offset: usize) -> *mut u8;
+    }
+
+    unsafe {
+        // Alloc RWX and MAP_PRIVATE | MAP_ANON
+        let ret = mmap(0 as *mut u8, size, 7, 34, -1, 0);
+        assert!(!ret.is_null());
+        
+        std::slice::from_raw_parts_mut(ret, size)
+    }
+}
+
 /// An R-type instruction
 #[derive(Debug)]
 struct Rtype {
@@ -140,6 +177,28 @@ impl From<u32> for Utype {
     }
 }
 
+/// An open file
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum File {
+    Stdin,
+    Stdout,
+    Stderr,
+
+    // A file which is backed by the current fuzz input
+    FuzzInput { cursor: usize },
+}
+
+/// A list of all open files
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Files(Vec<Option<File>>);
+
+impl Files {
+    /// Get access to a file descriptor for `fd`
+    pub fn get_file(&mut self, fd: usize) -> Option<&mut Option<File>> {
+        self.0.get_mut(fd)
+    }
+}
+
 /// All the state of the emulated system
 pub struct Emulator {
     /// Memory for the emulator
@@ -147,9 +206,15 @@ pub struct Emulator {
 
     /// All RV64i registers
     registers: [u64; 33],
+
+    /// Fuzz input for the program
+    pub fuzz_input: Vec<u8>,
+
+    /// File handle table (indexed by file descriptor)
+    pub files: Files,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Reasons why the VM exited
 pub enum VmExit {
     /// The VM exited due to a syscall instruction
@@ -170,6 +235,10 @@ pub enum VmExit {
 
     /// An read of `VirtAddr` failed due to missing permissions
     ReadFault(VirtAddr),
+
+    /// A read of memory which is uninitialized, but otherwise readable failed
+    /// at `VirtAddr`
+    UninitFault(VirtAddr),
     
     /// An write of `VirtAddr` failed due to missing permissions
     WriteFault(VirtAddr),
@@ -276,16 +345,24 @@ impl Emulator {
     /// Creates a new emulator with `size` bytes of memory
     pub fn new(size: usize) -> Self {
         Emulator {
-            memory:    Mmu::new(size),
-            registers: [0; 33],
+            memory:     Mmu::new(size),
+            registers:  [0; 33],
+            fuzz_input: Vec::new(),
+            files: Files(vec![
+                Some(File::Stdin),
+                Some(File::Stdout),
+                Some(File::Stderr),
+            ]),
         }
     }
 
     /// Fork an emulator into a new emulator which will diff from the original
     pub fn fork(&self) -> Self {
         Emulator {
-            memory:    self.memory.fork(),
-            registers: self.registers.clone(),
+            memory:     self.memory.fork(),
+            registers:  self.registers.clone(),
+            fuzz_input: self.fuzz_input.clone(),
+            files:      self.files.clone(),
         }
     }
 
@@ -297,6 +374,25 @@ impl Emulator {
 
         // Reset register state
         self.registers = other.registers;
+
+        // Reset file state
+        self.files.0.clear();
+        self.files.0.extend_from_slice(&other.files.0);
+    }
+
+    /// Allocate a new file descriptor
+    pub fn alloc_file(&mut self) -> usize {
+        for (fd, file) in self.files.0.iter().enumerate() {
+            if file.is_none() {
+                // File not present, we can reuse the FD
+                return fd;
+            }
+        }
+        
+        // If we got here, no FD is present, create a new one
+        let fd = self.files.0.len();
+        self.files.0.push(None);
+        fd
     }
 
     /// Get a register from the guest
