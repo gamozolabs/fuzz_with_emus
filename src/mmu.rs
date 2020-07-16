@@ -102,13 +102,13 @@ impl Mmu {
 
         // Clear the dirty list
         self.dirty.clear();
+
+        // Restore allocator state
+        self.cur_alc = other.cur_alc;
     }
 
     /// Allocate a region of memory as RW in the address space
     pub fn allocate(&mut self, size: usize) -> Option<VirtAddr> {
-        // 16-byte align the allocation
-        let align_size = (size + 0xf) & !0xf;
-
         // Get the current allocation base
         let base = self.cur_alc;
 
@@ -118,7 +118,7 @@ impl Mmu {
         }
 
         // Update the allocation size
-        self.cur_alc = VirtAddr(self.cur_alc.0.checked_add(align_size)?);
+        self.cur_alc = VirtAddr(self.cur_alc.0.checked_add(size)?);
 
         // Could not satisfy allocation without going OOM
         if self.cur_alc.0 > self.memory.len() {
@@ -197,8 +197,8 @@ impl Mmu {
     
     /// Return an immutable slice to memory at `addr` for `size` bytes that
     /// has been validated to match all `exp_perms`
-    pub fn peek_perms(&self, addr: VirtAddr, size: usize,
-                      exp_perms: Perm) -> Result<&[u8], VmExit> {
+    pub fn peek(&self, addr: VirtAddr, size: usize,
+                exp_perms: Perm) -> Result<&[u8], VmExit> {
         let perms =
             self.permissions.get(addr.0..addr.0.checked_add(size)
                 .ok_or(VmExit::AddressIntegerOverflow)?)
@@ -305,7 +305,7 @@ impl Mmu {
             // Update the allocator beyond any sections we load
             self.cur_alc = VirtAddr(std::cmp::max(
                 self.cur_alc.0,
-                (section.virt_addr.0 + section.mem_size + 0xf) & !0xf
+                (section.virt_addr.0 + section.mem_size + 0xfff) & !0xfff
             ));
         }
 
