@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::process::Command;
 use std::collections::BTreeMap;
+use crate::rdtsc;
 use crate::Corpus;
 use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC};
 use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE};
@@ -476,12 +477,16 @@ impl Emulator {
     }
 
     /// Run the VM using either the emulator or the JIT
-    pub fn run(&mut self, instrs_execed: &mut u64, corpus: &Corpus)
+    pub fn run(&mut self, instrs_execed: &mut u64,
+               vm_cycles: &mut u64, corpus: &Corpus)
             -> Result<(), VmExit> {
         if self.jit_cache.is_some() {
-            self.run_jit(instrs_execed, corpus)
+            self.run_jit(instrs_execed, vm_cycles, corpus)
         } else {
-            self.run_emu(instrs_execed, corpus)
+            let it = rdtsc();
+            let ret = self.run_emu(instrs_execed, corpus);
+            *vm_cycles += rdtsc() - it;
+            ret
         }
     }
 
@@ -502,6 +507,17 @@ impl Emulator {
             let inst: u32 = self.memory.read_perms(VirtAddr(pc as usize), 
                                                    Perm(PERM_EXEC))
                 .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
+
+            if let Some(callback) =
+                    self.breakpoints.get(&VirtAddr(pc as usize)) {
+                // Invoke the breakpoint callback
+                callback(self)?;
+
+                if self.reg(Register::Pc) != pc {
+                    // Callback changed PC, re-start emulation loop
+                    continue 'next_inst;
+                }
+            }
 
             // Update number of instructions executed
             *instrs_execed += 1;
@@ -968,7 +984,8 @@ impl Emulator {
     }
     
     /// Run the VM using the JIT
-    pub fn run_jit(&mut self, instrs_execed: &mut u64, corpus: &Corpus)
+    pub fn run_jit(&mut self, instrs_execed: &mut u64, 
+                   vm_cycles: &mut u64, corpus: &Corpus)
             -> Result<(), VmExit> {
         // Get the JIT addresses
         let (memory, perms, dirty, dirty_bitmap) = self.memory.jit_addrs();
@@ -1042,6 +1059,7 @@ impl Emulator {
                 let new_dirty_inuse: usize;
                 let mut instcount = *instrs_execed;
 
+                let it = rdtsc();
                 asm!(r#"
                     call {entry}
                 "#,
@@ -1059,6 +1077,7 @@ impl Emulator {
                 in("r14") trans_table,
                 inout("r15") instcount,
                 );
+                *vm_cycles += rdtsc() - it;
                 
                 // Update the PC reentry point
                 self.set_reg(Register::Pc, reentry_pc);
@@ -1130,7 +1149,7 @@ impl Emulator {
 
         // First in the block, check for an instruction timeout
         asm += &format!(r#"
-            cmp r15, 1_000_000_000
+            cmp r15, 100_000_000
             jb  no_timeout
 
             mov rax, 6
@@ -1159,6 +1178,8 @@ impl Emulator {
 
             // Add a label to this instruction
             asm += &format!("inst_pc_{:#x}:\n", pc);
+
+            //print!("Lifting {:#x}\n", pc);
 
             // Insert breakpoint if needed
             if self.breakpoints.contains_key(&VirtAddr(pc as usize)) {
@@ -1282,11 +1303,12 @@ impl Emulator {
                             let ret = pc.wrapping_add(4);
                             
                             asm += &format!(r#"
-                                mov rax, {ret}
-                                {store_rd_from_rax}
-
                                 {load_rax_from_rs1}
                                 add rax, {imm}
+                                mov rdx, rax
+
+                                mov rbx, {ret}
+                                {store_rd_from_rbx}
 
                                 shr rax, 2
                                 cmp rax, {num_blocks}
@@ -1300,17 +1322,15 @@ impl Emulator {
                                 jmp rax
 
                                 .jit_resolve:
-                                {load_rbx_from_rs1}
-                                add rbx, {imm}
+                                mov rbx, rdx
                                 mov rax, 1
                                 add r15, {block_instrs}
                                 ret
 
                             "#, imm = inst.imm,
                                 ret = ret,
-                                store_rd_from_rax = store_reg!(inst.rd, "rax"),
+                                store_rd_from_rbx = store_reg!(inst.rd, "rbx"),
                                 load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs1 = load_reg!("rbx", inst.rs1),
                                 block_instrs = block_instrs,
                                 num_blocks = num_blocks);
                             break 'next_inst;

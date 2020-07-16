@@ -453,18 +453,19 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                 emu.fuzz_input.extend_from_slice(input);
             }
 
+            /*
             if emu.fuzz_input.len() > 0 {
                 for _ in 0..rng.rand() % 32 {
                     let sel = rng.rand() % emu.fuzz_input.len();
                     emu.fuzz_input[sel] = rng.rand() as u8;
                 }
-            }
+            }*/
 
             let vmexit = loop {
-                let it = rdtsc();
-                let vmexit = emu.run(&mut run_instrs, &*corpus)
+                let vmexit = emu.run(&mut run_instrs,
+                                     &mut local_stats.vm_cycles,
+                                     &*corpus)
                     .expect_err("Failed to execute emulator");
-                local_stats.vm_cycles += rdtsc() - it;
 
                 match vmexit {
                     VmExit::Syscall => {
@@ -654,7 +655,7 @@ fn main() -> io::Result<()> {
     let jit_cache = Arc::new(JitCache::new(VirtAddr(16 * 1024 * 1024)));
 
     // Create an emulator using the JIT
-    let mut emu = Emulator::new(32 * 1024 * 1024).enable_jit(jit_cache);
+    let mut emu = Emulator::new(128 * 1024 * 1024).enable_jit(jit_cache);
 
     // Load the application into the emulator
     if true {
@@ -662,26 +663,26 @@ fn main() -> io::Result<()> {
             Section {
                 file_off:    0x0000000000000000,
                 virt_addr:   VirtAddr(0x0000000000010000),
-                file_size:   0x0000000000145768,
-                mem_size:    0x0000000000145768,
+                file_size:   0x000000000023bfe8,
+                mem_size:    0x000000000023bfe8,
                 permissions: Perm(PERM_READ | PERM_EXEC),
             },
             Section {
-                file_off:    0x0000000000146000,
-                virt_addr:   VirtAddr(0x0000000000156000),
-                file_size:   0x000000000000426a,
-                mem_size:    0x000000000000ba30,
+                file_off:    0x000000000023c000,
+                virt_addr:   VirtAddr(0x24c000),
+                file_size:   0x0000000000008a52,
+                mem_size:    0x00000000000104a8,
                 permissions: Perm(PERM_READ | PERM_WRITE),
             },
         ]).expect("Failed to load test application into address space");
 
-        emu.add_breakpoint(VirtAddr(0xe5770), malloc_bp);
-        emu.add_breakpoint(VirtAddr(0xe27cc), calloc_bp);
-        emu.add_breakpoint(VirtAddr(0xe3bb0), free_bp);
-        emu.add_breakpoint(VirtAddr(0xe7b54), realloc_bp);
+        emu.add_breakpoint(VirtAddr(0x1136e4), malloc_bp);
+        emu.add_breakpoint(VirtAddr(0x110740), calloc_bp);
+        emu.add_breakpoint(VirtAddr(0x111b24), free_bp);
+        emu.add_breakpoint(VirtAddr(0x115ac8), realloc_bp);
         
         // Set the program entry point
-        emu.set_reg(Register::Pc, 0x1092c);
+        emu.set_reg(Register::Pc, 0x10980);
     } else {
         emu.memory.load("./objdump_old", &[
             Section {
@@ -716,7 +717,7 @@ fn main() -> io::Result<()> {
         .expect("Failed to write program name");
     let arg1 = emu.memory.allocate(4096)
         .expect("Failed to allocate arg1");
-    emu.memory.write_from(arg1, b"-d\0")
+    emu.memory.write_from(arg1, b"-g\0")
         .expect("Failed to write arg1");
     let arg2 = emu.memory.allocate(4096)
         .expect("Failed to allocate arg1");
@@ -742,6 +743,7 @@ fn main() -> io::Result<()> {
     push!(progname.0); // Argv
     push!(3u64);   // Argc
 
+    /*
     loop {
         // Run the emulator to a certain point
         let mut tmp = 0;
@@ -764,7 +766,7 @@ fn main() -> io::Result<()> {
             }
             _ => break,
         }
-    }
+    }*/
 
     print!("Took snapshot\n");
 
@@ -774,7 +776,56 @@ fn main() -> io::Result<()> {
     // Create a new stats structure
     let stats = Arc::new(Mutex::new(Statistics::default()));
 
-    for _ in 0..192 {
+    // Create the stats thread
+    {
+        let corpus = corpus.clone();
+        let stats  = stats.clone();
+        std::thread::spawn(move || {
+            // Start a timer
+            let start = Instant::now();
+
+            let mut last_time = Instant::now();
+
+            let mut log = File::create("stats.txt").unwrap();
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                    
+                // Get access to the stats structure
+                let stats   = stats.lock().unwrap();
+                let elapsed = start.elapsed().as_secs_f64();
+
+                write!(log, "{:.6},{},{},{}\n", elapsed, stats.fuzz_cases,
+                       corpus.code_coverage.len(), corpus.unique_crashes.len())
+                    .unwrap();
+
+                if last_time.elapsed() >= Duration::from_millis(1000) {
+                    let fuzz_cases = stats.fuzz_cases;
+                    let instrs = stats.instrs_execed;
+
+                    // Compute performance numbers
+                    let resetc = stats.reset_cycles as f64 /
+                        stats.total_cycles as f64;
+                    let vmc = stats.vm_cycles as f64 /
+                        stats.total_cycles as f64;
+
+                    print!("[{:10.4}] cases {:10} | crashes {:10} | \
+                            unique crashes {:10} | \
+                            fcps {:10.1} | code {:10} | Minst/sec {:10.1} | \
+                            reset {:8.4} | vm {:8.4}\n",
+                           elapsed, fuzz_cases, stats.crashes,
+                           corpus.unique_crashes.len(),
+                           fuzz_cases as f64 / elapsed,
+                           corpus.code_coverage.len(),
+                           instrs as f64 / elapsed / 1_000_000.,
+                           resetc, vmc);
+
+                    last_time = Instant::now();
+                }
+            }
+        });
+    }
+
+    for _ in 0..1 {
         let new_emu = emu.fork();
         let stats   = stats.clone();
         let parent  = emu.clone();
@@ -783,50 +834,9 @@ fn main() -> io::Result<()> {
             worker(new_emu, parent, stats, corpus);
         });
     }
-    
-    // Start a timer
-    let start = Instant::now();
 
-    let mut last_cases  = 0;
-    let mut last_instrs = 0;
-    let mut last_time   = Instant::now();
-
-    let mut log = File::create("stats.txt")?;
     loop {
-        std::thread::sleep(Duration::from_millis(10));
-            
-        // Get access to the stats structure
-        let stats   = stats.lock().unwrap();
-        let elapsed = start.elapsed().as_secs_f64();
-
-        write!(log, "{:.6},{},{},{}\n", elapsed, stats.fuzz_cases,
-               corpus.code_coverage.len(), corpus.unique_crashes.len())?;
-
-        if last_time.elapsed() >= Duration::from_millis(1000) {
-            let time_delta = last_time.elapsed().as_secs_f64();
-
-            let fuzz_cases = stats.fuzz_cases;
-            let instrs = stats.instrs_execed;
-
-            // Compute performance numbers
-            let resetc = stats.reset_cycles as f64 / stats.total_cycles as f64;
-            let vmc    = stats.vm_cycles    as f64 / stats.total_cycles as f64;
-
-            print!("[{:10.4}] cases {:10} | crashes {:10} | \
-                    unique crashes {:10} | \
-                    fcps {:10.1} | code {:10} | Minst/sec {:10.1} | \
-                    reset {:8.4} | vm {:8.4}\n",
-                   elapsed, fuzz_cases, stats.crashes,
-                   corpus.unique_crashes.len(),
-                   (fuzz_cases - last_cases) as f64 / time_delta,
-                   corpus.code_coverage.len(),
-                   (instrs - last_instrs) as f64 / time_delta / 1_000_000.,
-                   resetc, vmc);
-
-            last_cases  = fuzz_cases;
-            last_instrs = instrs;
-            last_time   = Instant::now();
-        }
+        std::thread::sleep(Duration::from_millis(5000));
     }
 }
 
