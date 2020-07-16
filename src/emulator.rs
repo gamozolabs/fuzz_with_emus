@@ -10,6 +10,11 @@ use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC};
 use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE};
 use crate::jitcache::JitCache;
 
+/// If set, all register state will be saved before the execution of every
+/// instruction.
+/// This is INCREDIBLY slow and should only be used for debugging
+const ENABLE_TRACING: bool = true;
+
 /// An R-type instruction
 #[derive(Debug)]
 struct Rtype {
@@ -191,6 +196,10 @@ pub struct Emulator {
 
     /// JIT cache, if we are using a JIT
     jit_cache: Option<Arc<JitCache>>,
+
+    /// Trace of register states prior to every instruction execution
+    /// Only allocated if `ENABLE_TRACING` is `true`
+    trace: Vec<[u64; 33]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +413,8 @@ impl Emulator {
             ]),
             jit_cache: None,
             breakpoints: BTreeMap::new(),
+            trace: Vec::with_capacity(
+                if ENABLE_TRACING { 10_000_000 } else { 0 }),
         }
     }
 
@@ -416,6 +427,8 @@ impl Emulator {
             files:       self.files.clone(),
             jit_cache:   self.jit_cache.clone(),
             breakpoints: self.breakpoints.clone(),
+            trace: Vec::with_capacity(
+                if ENABLE_TRACING { 10_000_000 } else { 0 }),
         }
     }
 
@@ -443,6 +456,14 @@ impl Emulator {
         // Reset file state
         self.files.0.clear();
         self.files.0.extend_from_slice(&other.files.0);
+
+        for trace in &self.trace {
+            //print!("{:?}\n", trace);
+        }
+        print!("{}\n", self.trace.len());
+
+        // Reset trace state
+        self.trace.clear();
     }
 
     /// Allocate a new file descriptor
@@ -1059,6 +1080,19 @@ impl Emulator {
                 let new_dirty_inuse: usize;
                 let mut instcount = *instrs_execed;
 
+                // Extra scratch space for debug/rare accesses which don't
+                // deserve register allocation.
+                let mut scratchpad = [
+                    // 0 - 0x00 - Trace buffer
+                    self.trace.as_ptr() as usize,
+                    
+                    // 1 - 0x08 - Trace length
+                    self.trace.len(),
+                    
+                    // 2 - 0x10 - Trace capacity
+                    self.trace.capacity(),
+                ];
+
                 let it = rdtsc();
                 asm!(r#"
                     call {entry}
@@ -1068,6 +1102,7 @@ impl Emulator {
                 out("rbx") reentry_pc,
                 out("rcx") exit_info,
                 out("rdx") _,
+                in("rsi") scratchpad.as_mut_ptr(),
                 in("r8")  memory,
                 in("r9")  perms,
                 in("r10") dirty,
@@ -1078,6 +1113,9 @@ impl Emulator {
                 inout("r15") instcount,
                 );
                 *vm_cycles += rdtsc() - it;
+
+                // Update trace length
+                self.trace.set_len(scratchpad[1]);
                 
                 // Update the PC reentry point
                 self.set_reg(Register::Pc, reentry_pc);
@@ -1162,6 +1200,32 @@ impl Emulator {
         let mut pc = pc.0 as u64;
         let mut block_instrs = 0;
         'next_inst: loop {
+            // Produce the assembly statement to load RISC-V `reg` into
+            // `x86reg`
+            macro_rules! load_reg {
+                ($x86reg:expr, $reg:expr) => {
+                    if $reg == Register::Zero {
+                        format!("xor {x86reg}, {x86reg}\n", x86reg = $x86reg)
+                    } else {
+                        format!("mov {x86reg}, qword [r13 + {reg}*8]\n",
+                            x86reg = $x86reg, reg = $reg as usize)
+                    }
+                }
+            }
+            
+            // Produce the assembly statement to store RISC-V `reg` from
+            // `x86reg`
+            macro_rules! store_reg {
+                ($reg:expr, $x86reg:expr) => {
+                    if $reg == Register::Zero {
+                        String::new()
+                    } else {
+                        format!("mov qword [r13 + {reg}*8], {x86reg}\n",
+                            x86reg = $x86reg, reg = $reg as usize)
+                    }
+                }
+            }
+
             // Check alignment
             if pc & 3 != 0 {
                 // Code was unaligned, return a code fetch fault
@@ -1178,6 +1242,32 @@ impl Emulator {
 
             // Add a label to this instruction
             asm += &format!("inst_pc_{:#x}:\n", pc);
+
+            // Save the register state to the trace
+            if ENABLE_TRACING {
+                asm += &format!(r#"
+                    mov rax, {pc}
+                    {store_pc_from_rax}
+
+                    mov rax, [rsi + 0x08]
+                    cmp rax, [rsi + 0x10]
+                    jb  .has_room_for_trace
+
+                    int3
+
+                    .has_room_for_trace:
+                    push rsi
+                    imul rdi, [rsi + 0x08], 33 * 8
+                    add  rdi, [rsi + 0x00]
+                    mov  rsi, r13
+                    mov  rcx, 33
+                    rep  movsq
+                    pop  rsi
+
+                    inc qword [rsi + 0x08]
+                "#, store_pc_from_rax = store_reg!(Register::Pc, "rax"),
+                    pc = pc);
+            }
 
             //print!("Lifting {:#x}\n", pc);
 
@@ -1209,32 +1299,6 @@ impl Emulator {
 
             // Track number of instructions in the block
             block_instrs += 1;
-
-            // Produce the assembly statement to load RISC-V `reg` into
-            // `x86reg`
-            macro_rules! load_reg {
-                ($x86reg:expr, $reg:expr) => {
-                    if $reg == Register::Zero {
-                        format!("xor {x86reg}, {x86reg}\n", x86reg = $x86reg)
-                    } else {
-                        format!("mov {x86reg}, qword [r13 + {reg}*8]\n",
-                            x86reg = $x86reg, reg = $reg as usize)
-                    }
-                }
-            }
-            
-            // Produce the assembly statement to store RISC-V `reg` from
-            // `x86reg`
-            macro_rules! store_reg {
-                ($reg:expr, $x86reg:expr) => {
-                    if $reg == Register::Zero {
-                        String::new()
-                    } else {
-                        format!("mov qword [r13 + {reg}*8], {x86reg}\n",
-                            x86reg = $x86reg, reg = $reg as usize)
-                    }
-                }
-            }
 
             match opcode {
                 0b0110111 => {

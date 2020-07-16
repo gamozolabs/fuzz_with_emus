@@ -63,6 +63,7 @@ pub struct JitCache {
 // rbx - Scratch
 // rcx - Scratch
 // rdx - Scratch
+// rsi - Scratchpad memory
 // r8  - Pointer to the base of mmu.memory
 // r9  - Pointer to the base of mmu.permissions
 // r10 - Pointer to the base of mmu.dirty
@@ -70,6 +71,7 @@ pub struct JitCache {
 // r12 - Dirty index for the dirty list
 // r13 - Pointer to emu.registers
 // r14 - Pointer to the base of jitcache.blocks
+// r15 - Number of instructions executed
 //
 // JIT return code (in rax)
 // In all cases rbx = PC to resume execution at upon reentry
