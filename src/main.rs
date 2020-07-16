@@ -1,11 +1,22 @@
+#![feature(asm)]
+
 pub mod primitive;
 pub mod mmu;
 pub mod emulator;
+pub mod jitcache;
 
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use mmu::{VirtAddr, Perm, Section, PERM_READ, PERM_WRITE, PERM_EXEC};
-use emulator::{Emulator, Register, VmExit, File};
+use emulator::{Emulator, Register, VmExit, EmuFile, FaultType, AddressType};
+use jitcache::JitCache;
+
+use aht::Aht;
+use falkhash::FalkHasher;
+use atomicvec::AtomicVec;
 
 /// If `true` the guest writes to stdout and stderr will be printed to our own
 /// stdout and stderr
@@ -15,16 +26,72 @@ fn rdtsc() -> u64 {
     unsafe { std::arch::x86_64::_rdtsc() }
 }
 
+struct Rng(u64);
+
+impl Rng {
+    /// Create a new random number generator
+    fn new() -> Self {
+        Rng(0x8644d6eb17b7ab1a ^ rdtsc())
+    }
+
+    /// Generate a random number
+    #[inline]
+    fn rand(&mut self) -> usize {
+        let val = self.0;
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 43;
+        val as usize
+    }
+}
+
+/// Stat structure from kernel_stat64
+#[repr(C)]
+#[derive(Default, Debug)]
+struct Stat {
+    st_dev:     u64,
+    st_ino:     u64,
+    st_mode:    u32,
+    st_nlink:   u32,
+    st_uid:     u32,
+    st_gid:     u32,
+    st_rdev:    u64,
+    __pad1:     u64,
+
+    st_size:    i64,
+    st_blksize: i32,
+    __pad2:     i32,
+
+    st_blocks: i64,
+
+    st_atime:     u64,
+    st_atimensec: u64,
+    st_mtime:     u64,
+    st_mtimensec: u64,
+    st_ctime:     u64,
+    st_ctimensec: u64,
+    
+    __glibc_reserved: [i32; 2],
+}
+
 fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
     // Get the syscall number
     let num = emu.reg(Register::A7);
+
+    //print!("Syscall {}\n", num);
 
     match num {
         214 => {
             // brk()
             let req_base = emu.reg(Register::A0);
-            let cur_base = emu.memory.allocate(0).unwrap();
+            if req_base == 0 {
+                emu.set_reg(Register::A0, 0);
+                return Ok(());
+            }
 
+            panic!("Not expecting brk");
+
+            /*
             let increment = if req_base != 0 {
                 (req_base as i64).checked_sub(cur_base.0 as i64)
                     .ok_or(VmExit::SyscallIntegerOverflow)?
@@ -33,7 +100,10 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
             };
 
             // We don't handle negative brks yet
-            assert!(increment >= 0);
+            if increment < 0 {
+                emu.set_reg(Register::A0, cur_base.0 as u64);
+                return Ok(());
+            }
 
             // Attempt to extend data section by increment
             if let Some(_) = emu.memory.allocate(increment as usize) {
@@ -43,7 +113,7 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
                 emu.set_reg(Register::A0, !0);
             }
 
-            Ok(())
+            Ok(())*/
         }
         64 => {
             // write()
@@ -53,7 +123,7 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
 
             let file = emu.files.get_file(fd);
             if let Some(Some(file)) = file {
-                if file == &File::Stdout || file == &File::Stderr {
+                if file == &EmuFile::Stdout || file == &EmuFile::Stderr {
                     // Writes to stdout and stderr
 
                     // Get access to the underlying bytes to write
@@ -92,7 +162,7 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
                 return Ok(());
             }
             
-            if let Some(Some(File::FuzzInput { ref mut cursor })) = file {
+            if let Some(Some(EmuFile::FuzzInput { ref mut cursor })) = file {
                 // Compute the ending cursor from this read
                 let result_cursor = core::cmp::min(
                     cursor.saturating_add(len),
@@ -134,7 +204,7 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
                 return Ok(());
             }
 
-            if let Some(Some(File::FuzzInput { ref mut cursor })) = file {
+            if let Some(Some(EmuFile::FuzzInput { ref mut cursor })) = file {
                 let new_cursor = match whence {
                     SEEK_SET => offset,
                     SEEK_CUR => (*cursor as i64).saturating_add(offset),
@@ -191,63 +261,33 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
                 let file = emu.files.get_file(fd).unwrap();
 
                 // Mark that this file should be backed by our fuzz input
-                *file = Some(File::FuzzInput { cursor: 0 });
+                *file = Some(EmuFile::FuzzInput { cursor: 0 });
 
                 // Return a new fd
                 emu.set_reg(Register::A0, fd as u64);
             } else {
-                print!("Unknown filename: {:?}\n",
-                       core::str::from_utf8(bytes));
-
                 // Unknown filename
                 emu.set_reg(Register::A0, !0);
             }
 
             Ok(())
         }
-        80 => {
-            // fstat()
-            let fd      = emu.reg(Register::A0) as usize;
-            let statbuf = emu.reg(Register::A1);
-
-            /// Stat structure from kernel_stat64
-            #[repr(C)]
-            #[derive(Default, Debug)]
-            struct Stat {
-                st_dev:     u64,
-                st_ino:     u64,
-                st_mode:    u32,
-                st_nlink:   u32,
-                st_uid:     u32,
-                st_gid:     u32,
-                st_rdev:    u64,
-                __pad1:     u64,
-
-                st_size:    i64,
-                st_blksize: i32,
-                __pad2:     i32,
-
-                st_blocks: i64,
-
-                st_atime:     u64,
-                st_atimensec: u64,
-                st_mtime:     u64,
-                st_mtimensec: u64,
-                st_ctime:     u64,
-                st_ctimensec: u64,
-                
-                __glibc_reserved: [i32; 2],
+        1038 => {
+            // stat()
+            let filename = emu.reg(Register::A0) as usize;
+            let statbuf  = emu.reg(Register::A1);
+            
+            // Determine the length of the filename
+            let mut fnlen = 0;
+            while emu.memory.read::<u8>(VirtAddr(filename + fnlen))? != 0 {
+                fnlen += 1;
             }
+        
+            // Get the filename bytes
+            let bytes = emu.memory.peek(VirtAddr(filename),
+                fnlen, Perm(PERM_READ))?;
 
-            // Check if the FD is valid
-            let file = emu.files.get_file(fd);
-            if file.is_none() || file.as_ref().unwrap().is_none() {
-                // FD was not valid, return out with an error
-                emu.set_reg(Register::A0, !0);
-                return Ok(());
-            }
-
-            if let Some(Some(File::FuzzInput { .. })) = file {
+            if bytes == b"testfn" {
                 let mut stat = Stat::default();
                 stat.st_dev = 0x803;
                 stat.st_ino = 0x81889;
@@ -272,6 +312,53 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
 
                 // Write in the stat data
                 emu.memory.write_from(VirtAddr(statbuf as usize), stat)?;
+                emu.set_reg(Register::A0, 0);
+            } else {
+                // Error
+                emu.set_reg(Register::A0, !0);
+            }
+
+            Ok(())
+        }
+        80 => {
+            // fstat()
+            let fd      = emu.reg(Register::A0) as usize;
+            let statbuf = emu.reg(Register::A1);
+
+            // Check if the FD is valid
+            let file = emu.files.get_file(fd);
+            if file.is_none() || file.as_ref().unwrap().is_none() {
+                // FD was not valid, return out with an error
+                emu.set_reg(Register::A0, !0);
+                return Ok(());
+            }
+
+            if let Some(Some(EmuFile::FuzzInput { .. })) = file {
+                let mut stat = Stat::default();
+                stat.st_dev = 0x803;
+                stat.st_ino = 0x81889;
+                stat.st_mode = 0x81a4;
+                stat.st_nlink = 0x1;
+                stat.st_uid = 0x3e8;
+                stat.st_gid = 0x3e8;
+                stat.st_rdev = 0x0;
+                stat.st_size = emu.fuzz_input.len() as i64;
+                stat.st_blksize = 0x1000;
+                stat.st_blocks = (emu.fuzz_input.len() as i64 + 511) / 512;
+                stat.st_atime = 0x5f0fe246;
+                stat.st_mtime = 0x5f0fe244;
+                stat.st_ctime = 0x5f0fe244;
+
+                // Cast the stat structure to raw bytes
+                let stat = unsafe {
+                    core::slice::from_raw_parts(
+                        &stat as *const Stat as *const u8,
+                        core::mem::size_of_val(&stat))
+                };
+
+                // Write in the stat data
+                emu.memory.write_from(VirtAddr(statbuf as usize), stat)?;
+                emu.set_reg(Register::A0, 0);
             } else {
                 // Error
                 emu.set_reg(Register::A0, !0);
@@ -322,6 +409,9 @@ struct Statistics {
 
     /// Number of risc-v instructions executed
     instrs_execed: u64,
+    
+    /// Total number of crashes
+    crashes: u64,
 
     /// Total number of CPU cycles spent in the workers
     total_cycles: u64,
@@ -334,8 +424,9 @@ struct Statistics {
 }
 
 fn worker(mut emu: Emulator, original: Arc<Emulator>,
-          stats: Arc<Mutex<Statistics>>) {
-    const BATCH_SIZE: usize = 1;
+          stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
+    // Create a new random number generator
+    let mut rng = Rng::new();
 
     loop {
         // Start a timer
@@ -343,17 +434,35 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
         
         let mut local_stats = Statistics::default();
 
-        for _ in 0..BATCH_SIZE {
+        let it = rdtsc();
+        while (rdtsc() - it) < 500_000_000 {
             // Reset emu to original state
             let it = rdtsc();
             emu.reset(&*original);
             local_stats.reset_cycles += rdtsc() - it;
 
-            emu.fuzz_input.extend_from_slice(include_bytes!("../xauth"));
+            // Number of instructions executed this fuzz case
+            let mut run_instrs = 0u64;
 
-            let _vmexit = loop {
+            // Clear the fuzz input
+            emu.fuzz_input.clear();
+
+            // Pick a random file from the corpus as an input
+            let sel = rng.rand() % corpus.inputs.len();
+            if let Some(input) = corpus.inputs.get(sel) {
+                emu.fuzz_input.extend_from_slice(input);
+            }
+
+            if emu.fuzz_input.len() > 0 {
+                for _ in 0..rng.rand() % 32 {
+                    let sel = rng.rand() % emu.fuzz_input.len();
+                    emu.fuzz_input[sel] = rng.rand() as u8;
+                }
+            }
+
+            let vmexit = loop {
                 let it = rdtsc();
-                let vmexit = emu.run(&mut local_stats.instrs_execed)
+                let vmexit = emu.run(&mut run_instrs, &*corpus)
                     .expect_err("Failed to execute emulator");
                 local_stats.vm_cycles += rdtsc() - it;
 
@@ -371,18 +480,41 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                 }
             };
 
-            if _vmexit != VmExit::Exit {
-                panic!("Vmexit {:#x} {:#x?}\n",
-                       emu.reg(Register::Pc), _vmexit);
+            if let Some((fault_type, vaddr)) = vmexit.is_crash() {
+                // Update crash stats
+                local_stats.crashes += 1;
+
+                // Attempt to update hash table
+                let pc  = VirtAddr(emu.reg(Register::Pc) as usize);
+                let key = (pc, fault_type, AddressType::from(vaddr));
+                corpus.unique_crashes.entry_or_insert(&key, pc.0, || {
+                    // Save the input and log it in the hash table
+                    let hash = corpus.hasher.hash(&emu.fuzz_input);
+                    corpus.input_hashes.entry_or_insert(
+                            &hash, hash as usize, || {
+                        corpus.inputs.push(Box::new(emu.fuzz_input.clone()));
+                        Box::new(())
+                    });
+
+                    // Save the crashing file
+                    std::fs::write(Path::new("crashes").join(
+                        format!("{:#x}_{:?}_{:?}.crash",
+                                (key.0).0, key.1, key.2)),
+                        &emu.fuzz_input).expect("Failed to write fuzz input");
+
+                    Box::new(())
+                });
             }
 
-            local_stats.fuzz_cases += 1;
+            local_stats.instrs_execed += run_instrs;
+            local_stats.fuzz_cases    += 1;
         }
 
         // Get access to statistics
         let mut stats = stats.lock().unwrap();
 
         stats.fuzz_cases    += local_stats.fuzz_cases;
+        stats.crashes       += local_stats.crashes;
         stats.instrs_execed += local_stats.instrs_execed;
         stats.reset_cycles  += local_stats.reset_cycles;
         stats.vm_cycles     += local_stats.vm_cycles;
@@ -393,29 +525,184 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
     }
 }
 
-fn main() {
-    let mut emu = Emulator::new(32 * 1024 * 1024);
+/// Information about inputs and coverage
+pub struct Corpus {
+    /// Input hash table to dedup inputs
+    pub input_hashes: Aht<u128, (), 1048576>,
+    
+    /// Linear list of all inputs
+    pub inputs: AtomicVec<Vec<u8>, 1048576>,
+    
+    /// Unique crashes
+    /// Tuple is (PC, FaultType, AddressType)
+    pub unique_crashes: Aht<(VirtAddr, FaultType, AddressType), (), 1048576>,
+
+    /// Code coverage, unique PCs which have executed during fuzzing
+    pub code_coverage: Aht<VirtAddr, (), 1048576>,
+
+    /// Hasher
+    pub hasher: FalkHasher,
+}
+
+fn malloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+    if let Some(alc) = emu.memory.allocate(emu.reg(Register::A1) as usize) {
+        emu.set_reg(Register::A0, alc.0 as u64);
+    } else {
+        emu.set_reg(Register::A0, 0);
+    }
+
+    emu.set_reg(Register::Pc, emu.reg(Register::Ra));
+    Ok(())
+}
+
+fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+    let nmemb = emu.reg(Register::A1) as usize;
+    let size  = emu.reg(Register::A2) as usize;
+
+    let result = size.checked_mul(nmemb).and_then(|size| {
+        let alc = emu.memory.allocate(size)?;
+        let tmp = emu.memory.peek(alc, size, Perm(PERM_WRITE))
+            .expect("New allocation not writable?");
+        tmp.iter_mut().for_each(|x| *x = 0);
+        Some(alc)
+    }).unwrap_or(VirtAddr(0));
+
+    emu.set_reg(Register::A0, result.0 as u64);
+    emu.set_reg(Register::Pc, emu.reg(Register::Ra));
+    Ok(())
+}
+
+fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+    let old_alc = VirtAddr(emu.reg(Register::A1) as usize);
+    let size    = emu.reg(Register::A2) as usize;
+
+    // Get the old allocation size
+    let old_size = if old_alc == VirtAddr(0) {
+        // No previous allocation specified, thus no size
+        0
+    } else {
+        // Attempt to get the old allocation size
+        emu.memory.get_alc(old_alc).ok_or(VmExit::InvalidFree(old_alc))?
+    };
+
+    // Compute the size to copy
+    let to_copy = core::cmp::min(size, old_size);
+
+    // Allocate the new memory
+    let new_alc = emu.memory.allocate(size).and_then(|new_alc| {
+        if old_alc != VirtAddr(0) {
+            // Copy memory
+            for ii in 0..to_copy {
+                if let Ok(old) =
+                        emu.memory.read::<u8>(VirtAddr(old_alc.0 + ii)) {
+                    // Copy the memory only if we could read it from the old
+                    // allocation. This will preserve the uninitialized state
+                    // of bytes which haven't been initialized in the old
+                    // allocation
+                    emu.memory.write(VirtAddr(new_alc.0 + ii), old).unwrap();
+                }
+            }
+            
+            // Free the old allocation
+            emu.memory.free(old_alc).expect("Failed to free old allocation?");
+        }
+
+        Some(new_alc)
+    }).unwrap_or(VirtAddr(0));
+
+    emu.set_reg(Register::A0, new_alc.0 as u64);
+    emu.set_reg(Register::Pc, emu.reg(Register::Ra));
+    Ok(())
+}
+
+fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+    let base = VirtAddr(emu.reg(Register::A1) as usize);
+    if base != VirtAddr(0) {
+        emu.memory.free(base)?;
+    }
+    emu.set_reg(Register::Pc, emu.reg(Register::Ra));
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    std::fs::create_dir_all("inputs")?;
+    std::fs::create_dir_all("crashes")?;
+
+    // Create a corpus
+    let corpus = Arc::new(Corpus {
+        input_hashes: Aht::new(),
+        inputs: AtomicVec::new(),
+        hasher: FalkHasher::new(),
+        unique_crashes: Aht::new(),
+        code_coverage: Aht::new(),
+    });
+    
+    // Load the initial corpus
+    for filename in std::fs::read_dir("inputs")?{
+        let filename = filename?.path();
+        let data = std::fs::read(filename)?;
+        let hash = corpus.hasher.hash(&data);
+
+        // Save the input and log it in the hash table
+        corpus.input_hashes.entry_or_insert(&hash, hash as usize, || {
+            corpus.inputs.push(Box::new(data));
+            Box::new(())
+        });
+    }
+
+    // Create a JIT cache
+    let jit_cache = Arc::new(JitCache::new(VirtAddr(16 * 1024 * 1024)));
+
+    // Create an emulator using the JIT
+    let mut emu = Emulator::new(32 * 1024 * 1024).enable_jit(jit_cache);
 
     // Load the application into the emulator
-    emu.memory.load("./objdump", &[
-        Section {
-            file_off:    0x0000000000000000,
-            virt_addr:   VirtAddr(0x0000000000010000),
-            file_size:   0x00000000000e1994,
-            mem_size:    0x00000000000e1994,
-            permissions: Perm(PERM_READ | PERM_EXEC),
-        },
-        Section {
-            file_off:    0x00000000000e2000,
-            virt_addr:   VirtAddr(0x00000000000f2000),
-            file_size:   0x0000000000001e32,
-            mem_size:    0x00000000000046c8,
-            permissions: Perm(PERM_READ | PERM_WRITE),
-        },
-    ]).expect("Failed to load test application into address space");
+    if true {
+        emu.memory.load("./objdump", &[
+            Section {
+                file_off:    0x0000000000000000,
+                virt_addr:   VirtAddr(0x0000000000010000),
+                file_size:   0x0000000000145768,
+                mem_size:    0x0000000000145768,
+                permissions: Perm(PERM_READ | PERM_EXEC),
+            },
+            Section {
+                file_off:    0x0000000000146000,
+                virt_addr:   VirtAddr(0x0000000000156000),
+                file_size:   0x000000000000426a,
+                mem_size:    0x000000000000ba30,
+                permissions: Perm(PERM_READ | PERM_WRITE),
+            },
+        ]).expect("Failed to load test application into address space");
 
-    // Set the program entry point
-    emu.set_reg(Register::Pc, 0x104e8);
+        emu.add_breakpoint(VirtAddr(0xe5770), malloc_bp);
+        emu.add_breakpoint(VirtAddr(0xe27cc), calloc_bp);
+        emu.add_breakpoint(VirtAddr(0xe3bb0), free_bp);
+        emu.add_breakpoint(VirtAddr(0xe7b54), realloc_bp);
+        
+        // Set the program entry point
+        emu.set_reg(Register::Pc, 0x1092c);
+    } else {
+        emu.memory.load("./objdump_old", &[
+            Section {
+                file_off:    0x0000000000000000,
+                virt_addr:   VirtAddr(0x0000000000010000),
+                file_size:   0x00000000000e1994,
+                mem_size:    0x00000000000e1994,
+                permissions: Perm(PERM_READ | PERM_EXEC),
+            },
+            Section {
+                file_off:    0x00000000000e2000,
+                virt_addr:   VirtAddr(0x00000000000f2000),
+                file_size:   0x0000000000001e32,
+                mem_size:    0x00000000000046c8,
+                permissions: Perm(PERM_READ | PERM_WRITE),
+            },
+        ]).expect("Failed to load test application into address space");
+    
+        // Set the program entry point
+        emu.set_reg(Register::Pc, 0x104e8);
+    }
 
     // Set up a stack
     let stack = emu.memory.allocate(32 * 1024)
@@ -429,7 +716,7 @@ fn main() {
         .expect("Failed to write program name");
     let arg1 = emu.memory.allocate(4096)
         .expect("Failed to allocate arg1");
-    emu.memory.write_from(arg1, b"-x\0")
+    emu.memory.write_from(arg1, b"-d\0")
         .expect("Failed to write arg1");
     let arg2 = emu.memory.allocate(4096)
         .expect("Failed to allocate arg1");
@@ -455,6 +742,32 @@ fn main() {
     push!(progname.0); // Argv
     push!(3u64);   // Argc
 
+    loop {
+        // Run the emulator to a certain point
+        let mut tmp = 0;
+        let vmexit = emu.run(&mut tmp, &*corpus)
+            .expect_err("Failed to execute emulator");
+
+        match vmexit {
+            VmExit::Syscall => {
+                if emu.reg(Register::A7) == 1038 {
+                    break;
+                }
+
+                if let Err(_vmexit) = handle_syscall(&mut emu) {
+                    break;
+                }
+    
+                // Advance PC
+                let pc = emu.reg(Register::Pc);
+                emu.set_reg(Register::Pc, pc.wrapping_add(4));
+            }
+            _ => break,
+        }
+    }
+
+    print!("Took snapshot\n");
+
     // Wrap the original emulator in an `Arc`
     let emu = Arc::new(emu);
 
@@ -465,8 +778,9 @@ fn main() {
         let new_emu = emu.fork();
         let stats   = stats.clone();
         let parent  = emu.clone();
+        let corpus  = corpus.clone();
         std::thread::spawn(move || {
-            worker(new_emu, parent, stats);
+            worker(new_emu, parent, stats, corpus);
         });
     }
     
@@ -476,32 +790,43 @@ fn main() {
     let mut last_cases  = 0;
     let mut last_instrs = 0;
     let mut last_time   = Instant::now();
+
+    let mut log = File::create("stats.txt")?;
     loop {
-        std::thread::sleep(Duration::from_millis(1000));
-
+        std::thread::sleep(Duration::from_millis(10));
+            
         // Get access to the stats structure
-        let stats = stats.lock().unwrap();
-
-        let time_delta = last_time.elapsed().as_secs_f64();
+        let stats   = stats.lock().unwrap();
         let elapsed = start.elapsed().as_secs_f64();
 
-        let fuzz_cases = stats.fuzz_cases;
-        let instrs = stats.instrs_execed;
+        write!(log, "{:.6},{},{},{}\n", elapsed, stats.fuzz_cases,
+               corpus.code_coverage.len(), corpus.unique_crashes.len())?;
 
-        // Compute performance numbers
-        let resetc = stats.reset_cycles as f64 / stats.total_cycles as f64;
-        let vmc    = stats.vm_cycles    as f64 / stats.total_cycles as f64;
+        if last_time.elapsed() >= Duration::from_millis(1000) {
+            let time_delta = last_time.elapsed().as_secs_f64();
 
-        print!("[{:10.4}] cases {:10} | fcps {:10.1} | inst/sec {:10.1}\n    \
+            let fuzz_cases = stats.fuzz_cases;
+            let instrs = stats.instrs_execed;
+
+            // Compute performance numbers
+            let resetc = stats.reset_cycles as f64 / stats.total_cycles as f64;
+            let vmc    = stats.vm_cycles    as f64 / stats.total_cycles as f64;
+
+            print!("[{:10.4}] cases {:10} | crashes {:10} | \
+                    unique crashes {:10} | \
+                    fcps {:10.1} | code {:10} | Minst/sec {:10.1} | \
                     reset {:8.4} | vm {:8.4}\n",
-               elapsed, fuzz_cases,
-               (fuzz_cases - last_cases) as f64 / time_delta,
-               (instrs - last_instrs) as f64 / time_delta,
-               resetc, vmc);
+                   elapsed, fuzz_cases, stats.crashes,
+                   corpus.unique_crashes.len(),
+                   (fuzz_cases - last_cases) as f64 / time_delta,
+                   corpus.code_coverage.len(),
+                   (instrs - last_instrs) as f64 / time_delta / 1_000_000.,
+                   resetc, vmc);
 
-        last_cases  = fuzz_cases;
-        last_instrs = instrs;
-        last_time   = Instant::now();
+            last_cases  = fuzz_cases;
+            last_instrs = instrs;
+            last_time   = Instant::now();
+        }
     }
 }
 
