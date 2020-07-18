@@ -1,5 +1,3 @@
-#![feature(asm)]
-
 pub mod primitive;
 pub mod mmu;
 pub mod emulator;
@@ -10,6 +8,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::collections::BTreeSet;
 use mmu::{VirtAddr, Perm, Section, PERM_READ, PERM_WRITE, PERM_EXEC};
 use emulator::{Emulator, Register, VmExit, EmuFile, FaultType, AddressType};
 use jitcache::JitCache;
@@ -427,7 +426,6 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
           stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
     // Create a new random number generator
     let mut rng = Rng::new();
-    print!("{}\n", rng.rand());
 
     loop {
         // Start a timer
@@ -449,20 +447,17 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
             emu.fuzz_input.clear();
 
             // Pick a random file from the corpus as an input
-            let sel = 0; //rng.rand() % corpus.inputs.len();
+            let sel = rng.rand() % corpus.inputs.len();
             if let Some(input) = corpus.inputs.get(sel) {
                 emu.fuzz_input.extend_from_slice(input);
             }
 
-            assert!(emu.fuzz_input.len() == 14680);
-            
-            /*
             if emu.fuzz_input.len() > 0 {
                 for _ in 0..rng.rand() % 128 {
                     let sel = rng.rand() % emu.fuzz_input.len();
                     emu.fuzz_input[sel] = rng.rand() as u8;
                 }
-            }*/
+            }
 
             let vmexit = loop {
                 let vmexit = emu.run(&mut run_instrs,
@@ -541,11 +536,18 @@ pub struct Corpus {
     /// Tuple is (PC, FaultType, AddressType)
     pub unique_crashes: Aht<(VirtAddr, FaultType, AddressType), (), 1048576>,
 
-    /// Code coverage, unique PCs which have executed during fuzzing
-    pub code_coverage: Aht<VirtAddr, (), 1048576>,
+    /// Code coverage, (to, from) edges for _all_ branches, including
+    /// taken, not taken, indirect, and unconditional
+    pub code_coverage: Aht<(VirtAddr, VirtAddr), (), 1048576>,
 
     /// Hasher
     pub hasher: FalkHasher,
+
+    /// Coverage bitmap
+    pub coverage_bitmap: Vec<u64>,
+
+    /// Active compile jobs
+    compile_jobs: Mutex<BTreeSet<u128>>,
 }
 
 fn malloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
@@ -643,6 +645,8 @@ fn main() -> io::Result<()> {
         hasher: FalkHasher::new(),
         unique_crashes: Aht::new(),
         code_coverage: Aht::new(),
+        compile_jobs: Default::default(),
+        coverage_bitmap: vec![0u64; 1024 * 1024],
     });
     
     // Load the initial corpus
@@ -659,10 +663,10 @@ fn main() -> io::Result<()> {
     }
 
     // Create a JIT cache
-    let jit_cache = Arc::new(JitCache::new(VirtAddr(16 * 1024 * 1024)));
+    let jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
 
     // Create an emulator using the JIT
-    let mut emu = Emulator::new(128 * 1024 * 1024).enable_jit(jit_cache);
+    let mut emu = Emulator::new(32 * 1024 * 1024).enable_jit(jit_cache);
 
     // Load the application into the emulator
     if true {
@@ -802,8 +806,9 @@ fn main() -> io::Result<()> {
                 let stats   = stats.lock().unwrap();
                 let elapsed = start.elapsed().as_secs_f64();
 
-                write!(log, "{:.6},{},{},{}\n", elapsed, stats.fuzz_cases,
-                       corpus.code_coverage.len(), corpus.unique_crashes.len())
+                write!(log, "{:.6},{},{},{},{}\n", elapsed, stats.fuzz_cases,
+                       corpus.code_coverage.len(), corpus.unique_crashes.len(),
+                       corpus.inputs.len())
                     .unwrap();
 
                 if last_time.elapsed() >= Duration::from_millis(1000) {
@@ -816,11 +821,11 @@ fn main() -> io::Result<()> {
                     let vmc = stats.vm_cycles as f64 /
                         stats.total_cycles as f64;
 
-                    print!("[{:10.4}] cases {:10} | crashes {:10} | \
+                    print!("[{:10.4}] cases {:10} | inputs {:10} | \
                             unique crashes {:10} | \
                             fcps {:10.1} | code {:10} | Minst/sec {:10.1} | \
                             reset {:8.4} | vm {:8.4}\n",
-                           elapsed, fuzz_cases, stats.crashes,
+                           elapsed, fuzz_cases, corpus.inputs.len(),
                            corpus.unique_crashes.len(),
                            fuzz_cases as f64 / elapsed,
                            corpus.code_coverage.len(),
@@ -833,7 +838,7 @@ fn main() -> io::Result<()> {
         });
     }
 
-    for _ in 0..1 {
+    for _ in 0..192 {
         let new_emu = emu.fork();
         let stats   = stats.clone();
         let parent  = emu.clone();

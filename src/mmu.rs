@@ -10,7 +10,7 @@ use crate::primitive::Primitive;
 /// The larger this is, the fewer but more expensive memcpys() need to occur,
 /// the small, the greater but less expensive memcpys() need to occur.
 /// It seems the sweet spot is often 128-4096 bytes
-pub const DIRTY_BLOCK_SIZE: usize = 128;
+pub const DIRTY_BLOCK_SIZE: usize = 1024;
 
 /// If `true` the logic for uninitialized memory tracking will be disabled and
 /// all memory will be marked as readable if it has the RAW bit set

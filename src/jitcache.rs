@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
 use crate::mmu::VirtAddr;
 
 #[cfg(target_os="windows")]
@@ -54,8 +55,9 @@ pub struct JitCache {
     /// variant)
     blocks: Box<[AtomicUsize]>,
 
-    /// The raw JIT RWX backing, and the amount of bytes in use
-    jit: Mutex<(&'static mut [u8], usize)>,
+    /// The raw JIT RWX backing, the amount of bytes in use, and a dedup
+    /// table
+    jit: Mutex<(&'static mut [u8], usize, BTreeMap<Vec<u8>, usize>)>,
 }
 
 // JIT calling convention
@@ -93,7 +95,8 @@ impl JitCache {
             blocks: (0..(max_guest_addr.0 + 3) / 4).map(|_| {
                 AtomicUsize::new(0)
             }).collect::<Vec<_>>().into_boxed_slice(),
-            jit: Mutex::new((alloc_rwx(16 * 1024 * 1024), 0)),
+            jit:
+                Mutex::new((alloc_rwx(256 * 1024 * 1024), 0, BTreeMap::new())),
         }
     }
 
@@ -139,28 +142,37 @@ impl JitCache {
             return existing;
         }
 
-        // Compute the aligned size of code, this ensures we can do aligned
-        // vector operations because we ensure alignment of loaded JITs
-        let align_size = (code.len() + 0x3f) & !0x3f;
+        // Check if we already have identical code
+        let new_addr = if let Some(&existing) = jit.2.get(code) {
+            // We have identical code, alias this code for the requested PC
+            existing
+        } else {
+            // Compute the aligned size of code, this ensures we can do aligned
+            // vector operations because we ensure alignment of loaded JITs
+            let align_size = (code.len() + 0x3f) & !0x3f;
 
-        // Number of remaining bytes in the JIT storage
-        let jit_inuse  = jit.1;
-        let jit_remain = jit.0.len() - jit_inuse;
-        assert!(jit_remain > align_size, "Out of space in JIT");
+            // Number of remaining bytes in the JIT storage
+            let jit_inuse  = jit.1;
+            let jit_remain = jit.0.len() - jit_inuse;
+            assert!(jit_remain > align_size, "Out of space in JIT");
 
-        // Copy the new code into the JIT
-        jit.0[jit_inuse..jit_inuse + code.len()].copy_from_slice(code);
+            // Copy the new code into the JIT
+            jit.0[jit_inuse..jit_inuse + code.len()].copy_from_slice(code);
 
-        // Compute the address of the JIT we're inserting
-        let new_addr = jit.0[jit_inuse..].as_ptr() as usize;
+            // Compute the address of the JIT we're inserting
+            let new_addr = jit.0[jit_inuse..].as_ptr() as usize;
+            
+            // Update the in use for the JIT
+            jit.1 += align_size;
+
+            // Update the dedup table
+            assert!(jit.2.insert(code.into(), new_addr).is_none());
+
+            new_addr
+        };
 
         // Update the JIT lookup address
         self.blocks[addr.0 / 4].store(new_addr, Ordering::SeqCst);
-
-        // Update the in use for the JIT
-        jit.1 += align_size;
-
-        //print!("Added jit for {:#x} -> {:#x}\n", addr.0, new_addr);
 
         // Return the newly allocated JIT
         new_addr

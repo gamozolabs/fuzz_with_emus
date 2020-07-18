@@ -1,7 +1,10 @@
 //! A 64-bit RISC-V RV64i interpreter
 
 use std::fmt;
+use std::mem::size_of_val;
 use std::sync::Arc;
+use std::path::Path;
+use std::time::Duration;
 use std::process::Command;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::rdtsc;
@@ -18,7 +21,7 @@ const ENABLE_TRACING: bool = false;
 /// Make sure this stays in sync with the C++ JIT version of this structure
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExitReason {
+pub enum ExitReason {
     None,
     IndirectBranch,
     ReadFault,
@@ -28,23 +31,52 @@ enum ExitReason {
     Timeout,
     Breakpoint,
     InvalidOpcode,
+    Coverage,
 }
 
 /// Make sure this stays in sync with the C++ JIT version of this structure
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GuestState {
-    exit_reason:  ExitReason,
-    reenter_pc:   u64,
-    regs:         [u64; 33],
-    memory:       usize,
-    permissions:  usize,
-    dirty:        usize,
-    dirty_idx:    usize,
-    dirty_bitmap: usize,
-    trace_buffer: usize,
-    trace_idx:    usize,
-    trace_len:    usize,
+    exit_reason:   ExitReason,
+    reenter_pc:    u64,
+    cov_from:      u64,
+    cov_to:        u64,
+    regs:          [u64; 33],
+    memory:        usize,
+    permissions:   usize,
+    dirty:         usize,
+    dirty_idx:     usize,
+    dirty_bitmap:  usize,
+    trace_buffer:  usize,
+    trace_idx:     usize,
+    trace_len:     usize,
+    cov_bitmap:    usize,
+    instrs_execed: u64,
+    timeout:       u64,
+}
+
+impl Default for GuestState {
+    fn default() -> Self {
+        GuestState {
+            exit_reason:   ExitReason::None,
+            reenter_pc:    0,
+            cov_from:      0,
+            cov_to:        0,
+            regs:          [0; 33],
+            memory:        0,
+            permissions:   0,
+            dirty:         0,
+            dirty_idx:     0,
+            dirty_bitmap:  0,
+            trace_buffer:  0,
+            trace_idx:     0,
+            trace_len:     0,
+            cov_bitmap:    0,
+            instrs_execed: 0,
+            timeout:       50_000_000,
+        }
+    }
 }
 
 /// An R-type instruction
@@ -441,19 +473,7 @@ impl Emulator {
 
         Emulator {
             memory: Mmu::new(size),
-            state:  GuestState {
-                exit_reason:  ExitReason::None,
-                reenter_pc:   0,
-                regs:         [0; 33],
-                memory:       0,
-                permissions:  0,
-                dirty:        0,
-                dirty_idx:    0,
-                dirty_bitmap: 0,
-                trace_buffer: 0,
-                trace_idx:    0,
-                trace_len:    0,
-            },
+            state:  GuestState::default(),
             fuzz_input: Vec::new(),
             files: Files(vec![
                 Some(EmuFile::Stdin),
@@ -469,9 +489,12 @@ impl Emulator {
 
     /// Fork an emulator into a new emulator which will diff from the original
     pub fn fork(&self) -> Self {
+        let mut state = GuestState::default();
+        state.regs = self.state.regs;
+
         Emulator {
             memory:      self.memory.fork(),
-            state:       self.state.clone(),
+            state:       state,
             fuzz_input:  self.fuzz_input.clone(),
             files:       self.files.clone(),
             jit_cache:   self.jit_cache.clone(),
@@ -592,21 +615,7 @@ impl Emulator {
             if ENABLE_TRACING {
                 self.trace.push(self.state.regs);
             }
-            
-            // Update code coverage
-            corpus.code_coverage.entry_or_insert(
-                &VirtAddr(pc as usize), pc as usize, || {
-                    // Save the input and log it in the hash table
-                    let hash = corpus.hasher.hash(&self.fuzz_input);
-                    corpus.input_hashes.entry_or_insert(
-                            &hash, hash as usize, || {
-                        corpus.inputs.push(Box::new(self.fuzz_input.clone()));
-                        Box::new(())
-                    });
-
-                    Box::new(())
-                });
-
+           
             if let Some(callback) =
                     self.breakpoints.get(&VirtAddr(pc as usize)) {
                 // Invoke the breakpoint callback
@@ -1075,9 +1084,6 @@ impl Emulator {
         // Get the JIT addresses
         let (memory, perms, dirty, dirty_bitmap) = self.memory.jit_addrs();
 
-        // Get the translation table
-        let trans_table = self.jit_cache.as_ref().unwrap().translation_table();
-
         // If `Some`, we re-entry the JIT by jumping directly to this address,
         // ignoring PC
         let mut override_jit_addr = None;
@@ -1089,42 +1095,16 @@ impl Emulator {
             } else {
                 // Get the current PC
                 let pc = self.reg(Register::Pc);
-                let (jit_addr, num_blocks) = {
+                let jit_addr = {
                     let jit_cache = self.jit_cache.as_ref().unwrap();
-                    (
-                        jit_cache.lookup(VirtAddr(pc as usize)),
-                        jit_cache.num_blocks()
-                    )
+                    jit_cache.lookup(VirtAddr(pc as usize))
                 };
 
                 if let Some(jit_addr) = jit_addr {
                     jit_addr
                 } else {
                     // Generate the JIT for this PC
-                    let tmp = self.test_jit(VirtAddr(pc as usize))?;
-
-                    /*
-                    // Write out the assembly
-                    let asmfn = std::env::temp_dir().join(
-                        format!("fwetmp_{:?}.asm",
-                                std::thread::current().id()));
-                    let binfn = std::env::temp_dir().join(
-                        format!("fwetmp_{:?}.bin",
-                                std::thread::current().id()));
-                    std::fs::write(&asmfn, &asm)
-                        .expect("Failed to write out asm");
-
-                    // Invoke NASM to generate the binary
-                    let res = Command::new("nasm").args(&[
-                        "-f", "bin", "-o", binfn.to_str().unwrap(),
-                        asmfn.to_str().unwrap()
-                    ]).status()
-                        .expect("Failed to run nasm, is it in your path?");
-                    assert!(res.success(), "nasm returned an error");
-
-                    // Read the binary
-                    let tmp = std::fs::read(&binfn)
-                        .expect("Failed to read nasm output");*/
+                    let tmp = self.compile_jit(VirtAddr(pc as usize), corpus)?;
 
                     // Update the JIT tables
                     self.jit_cache.as_ref().unwrap().add_mapping(
@@ -1133,18 +1113,22 @@ impl Emulator {
             };
 
             // Set up the JIT state
-            self.state.memory       = memory;
-            self.state.permissions  = perms;
-            self.state.dirty        = dirty;
-            self.state.dirty_idx    = self.memory.dirty_len();
-            self.state.dirty_bitmap = dirty_bitmap;
-            self.state.trace_buffer = self.trace.as_ptr() as usize;
-            self.state.trace_idx    = self.trace.len();
-            self.state.trace_len    = self.trace.capacity();
+            self.state.instrs_execed = *instrs_execed;
+            self.state.memory        = memory;
+            self.state.permissions   = perms;
+            self.state.dirty         = dirty;
+            self.state.dirty_idx     = self.memory.dirty_len();
+            self.state.dirty_bitmap  = dirty_bitmap;
+            self.state.trace_buffer  = self.trace.as_ptr() as usize;
+            self.state.trace_idx     = self.trace.len();
+            self.state.trace_len     = self.trace.capacity();
+            self.state.cov_bitmap    =
+                corpus.coverage_bitmap.as_ptr() as usize;
                     
             let jit_cache = self.jit_cache.as_ref().unwrap();
 
-            'quick_reenter: loop { 
+            let it = rdtsc();
+            'quick_reenter: loop {
                 unsafe {
                     // Create a function pointer to the JIT
                     let func =
@@ -1169,7 +1153,11 @@ impl Emulator {
                     break 'quick_reenter;
                 }
             }
-                    
+            *vm_cycles += rdtsc() - it;
+
+            // Update instructions executed from JIT state
+            *instrs_execed = self.state.instrs_execed;
+
             // Update the PC reentry point
             self.set_reg(Register::Pc, self.state.reenter_pc);
                     
@@ -1183,6 +1171,28 @@ impl Emulator {
 
             match self.state.exit_reason {
                 ExitReason::None => unreachable!(),
+                ExitReason::Coverage => {
+                    // Update code coverage
+                    let key = (
+                        VirtAddr(self.state.cov_from as usize),
+                        VirtAddr(self.state.cov_to as usize),
+                    );
+                    corpus.code_coverage.entry_or_insert(
+                        &key, self.state.cov_to as usize, || {
+                            // Save the input and log it in the hash table
+                            let hash = corpus.hasher.hash(&self.fuzz_input);
+                            corpus.input_hashes.entry_or_insert(
+                                    &hash, hash as usize, || {
+                                corpus.inputs.push(
+                                    Box::new(self.fuzz_input.clone()));
+                                Box::new(())
+                            });
+
+                            Box::new(())
+                        });
+
+                    // Fall through to re-execute instruction
+                }
                 ExitReason::IndirectBranch => {
                     // Just fall through to translate to JIT
                 }
@@ -1234,986 +1244,13 @@ impl Emulator {
                     return Err(VmExit::InvalidOpcode);
                 }
             }
-
-            /*
-            unsafe {
-                // Invoke the jit
-                let exit_code:  u64;
-                let reentry_pc: u64;
-                let exit_info: u64;
-            
-                let dirty_inuse = self.memory.dirty_len();
-                let new_dirty_inuse: usize;
-                let mut instcount = *instrs_execed;
-
-                // Extra scratch space for debug/rare accesses which don't
-                // deserve register allocation.
-                let mut scratchpad = [
-                    // 0 - 0x00 - Trace buffer
-                    self.trace.as_ptr() as usize,
-                    
-                    // 1 - 0x08 - Trace length
-                    self.trace.len(),
-                    
-                    // 2 - 0x10 - Trace capacity
-                    self.trace.capacity(),
-                ];
-
-                let it = rdtsc();
-                asm!(r#"
-                    call {entry}
-                "#,
-                entry = in(reg) jit_addr,
-                out("rax") exit_code,
-                out("rbx") reentry_pc,
-                out("rcx") exit_info,
-                out("rdx") _,
-                in("rsi") scratchpad.as_mut_ptr(),
-                in("r8")  memory,
-                in("r9")  perms,
-                in("r10") dirty,
-                in("r11") dirty_bitmap,
-                inout("r12") dirty_inuse => new_dirty_inuse,
-                in("r13") self.state.regs.as_ptr(),
-                in("r14") trans_table,
-                inout("r15") instcount,
-                );
-                *vm_cycles += rdtsc() - it;
-
-                // Update trace length
-                self.trace.set_len(scratchpad[1]);
-                
-                // Update the PC reentry point
-                self.set_reg(Register::Pc, reentry_pc);
-
-                // Update instrs execed
-                *instrs_execed = instcount;
-
-                // Update the dirty state
-                self.memory.set_dirty_len(new_dirty_inuse);
-
-                match exit_code {
-                    1 => {
-                        // Branch decode request, just continue as PC has been
-                        // updated to the new target
-                    }
-                    2 => {
-                        // Syscall
-                        return Err(VmExit::Syscall);
-                    }
-                    4 => {
-                        // Read fault
-                        // The JIT reports the address of the base of the
-                        // access, invoke the emulator to get the specific
-                        // byte which caused the fault
-                        return self.run_emu(instrs_execed, corpus);
-                    }
-                    5 => {
-                        // Write fault
-                        // The JIT reports the address of the base of the
-                        // access, invoke the emulator to get the specific
-                        // byte which caused the fault
-                        return self.run_emu(instrs_execed, corpus);
-                    }
-                    6 => {
-                        // Hit the instruction count timeout
-                        return Err(VmExit::Timeout);
-                    }
-                    7 => {
-                        // Hit breakpoint, invoke callback
-                        let pc = VirtAddr(reentry_pc as usize);
-                        if let Some(callback) = self.breakpoints.get(&pc) {
-                            callback(self)?;
-                        }
-
-                        if self.reg(Register::Pc) == reentry_pc {
-                            // Force execution at the return location, which
-                            // will skip over the breakpoint return
-                            override_jit_addr = Some(exit_info as usize);
-                        } else {
-                            // PC was changed by the breakpoint handler,
-                            // thus we respect its change and will jump
-                            // to the target it specified
-                        }
-                    }
-                    8 => {
-                        // An invalid opcode was executed
-                        return Err(VmExit::InvalidOpcode);
-                    }
-                    _ => unreachable!(),
-                }
-            }*/
         }
     }
 
-    /// Generates the assembly string for `pc` during JIT
-    pub fn generate_jit(&self, pc: VirtAddr, num_blocks: usize,
-                        corpus: &Corpus) -> Result<String, VmExit> {
-        let mut asm = "[bits 64]\n".to_string();
-
-        // First in the block, check for an instruction timeout
-        asm += &format!(r#"
-            cmp r15, 100_000_000
-            jb  no_timeout
-
-            mov rax, 6
-            mov rbx, {pc}
-            ret
-
-            no_timeout:
-        "#, pc = pc.0);
-
-        let mut pc = pc.0 as u64;
-        let mut block_instrs = 0;
-        'next_inst: loop {
-            // Produce the assembly statement to load RISC-V `reg` into
-            // `x86reg`
-            macro_rules! load_reg {
-                ($x86reg:expr, $reg:expr) => {
-                    if $reg == Register::Zero {
-                        format!("xor {x86reg}, {x86reg}\n", x86reg = $x86reg)
-                    } else {
-                        format!("mov {x86reg}, qword [r13 + {reg}*8]\n",
-                            x86reg = $x86reg, reg = $reg as usize)
-                    }
-                }
-            }
-            
-            // Produce the assembly statement to store RISC-V `reg` from
-            // `x86reg`
-            macro_rules! store_reg {
-                ($reg:expr, $x86reg:expr) => {
-                    if $reg == Register::Zero {
-                        String::new()
-                    } else {
-                        format!("mov qword [r13 + {reg}*8], {x86reg}\n",
-                            x86reg = $x86reg, reg = $reg as usize)
-                    }
-                }
-            }
-
-            // Check alignment
-            if pc & 3 != 0 {
-                // Code was unaligned, return a code fetch fault
-                return Err(VmExit::ExecFault(VirtAddr(pc as usize)));
-            }
-
-            // Read the instruction
-            let inst: u32 = self.memory.read_perms(VirtAddr(pc as usize), 
-                                                   Perm(PERM_EXEC))
-                .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
-
-            // Extract the opcode from the instruction
-            let opcode = inst & 0b1111111;
-
-            // Add a label to this instruction
-            asm += &format!("inst_pc_{:#x}:\n", pc);
-
-            // Save the register state to the trace
-            if ENABLE_TRACING {
-                asm += &format!(r#"
-                    mov rax, {pc}
-                    {store_pc_from_rax}
-
-                    mov rax, [rsi + 0x08]
-                    cmp rax, [rsi + 0x10]
-                    jb  .has_room_for_trace
-
-                    int3
-
-                    .has_room_for_trace:
-                    push rsi
-                    imul rdi, [rsi + 0x08], 33 * 8
-                    add  rdi, [rsi + 0x00]
-                    mov  rsi, r13
-                    mov  rcx, 33
-                    rep  movsq
-                    pop  rsi
-
-                    inc qword [rsi + 0x08]
-                "#, store_pc_from_rax = store_reg!(Register::Pc, "rax"),
-                    pc = pc);
-            }
-
-            //print!("Lifting {:#x}\n", pc);
-
-            // Insert breakpoint if needed
-            if self.breakpoints.contains_key(&VirtAddr(pc as usize)) {
-                asm += &format!(r#"
-                    lea rcx, [rel .after_bp]
-                    mov rax, 7
-                    mov rbx, {pc}
-                    ret
-
-                    .after_bp:
-                "#, pc = pc);
-            }
-            
-            // Update code coverage
-            corpus.code_coverage.entry_or_insert(
-                &VirtAddr(pc as usize), pc as usize, || {
-                    // Save the input and log it in the hash table
-                    let hash = corpus.hasher.hash(&self.fuzz_input);
-                    corpus.input_hashes.entry_or_insert(
-                            &hash, hash as usize, || {
-                        corpus.inputs.push(Box::new(self.fuzz_input.clone()));
-                        Box::new(())
-                    });
-
-                    Box::new(())
-                });
-
-            // Track number of instructions in the block
-            block_instrs += 1;
-
-            match opcode {
-                0b0110111 => {
-                    // LUI
-                    let inst = Utype::from(inst);
-                    asm += &store_reg!(inst.rd, inst.imm);
-                }
-                0b0010111 => {
-                    // AUIPC
-                    let inst = Utype::from(inst);
-                    let val = (inst.imm as i64 as u64).wrapping_add(pc);
-                    asm += &format!(r#"
-                        mov rax, {imm:#x}
-                        {store_rd_from_rax}
-                    "#, imm = val,
-                        store_rd_from_rax = store_reg!(inst.rd, "rax"));
-                }
-                0b1101111 => {
-                    // JAL
-                    let inst = Jtype::from(inst);
-
-                    // Compute the return address
-                    let ret = pc.wrapping_add(4);
-
-                    // Compute the branch target
-                    let target = pc.wrapping_add(inst.imm as i64 as u64);
-
-                    if (target / 4) >= num_blocks as u64 {
-                        // Branch target is out of bounds
-                        panic!("JITOOB");
-                    }
-                    
-                    asm += &format!(r#"
-                        mov rax, {ret}
-                        {store_rd_from_rax}
-                       
-                        mov  rax, [r14 + {target}]
-                        test rax, rax
-                        jz   .jit_resolve
-
-                        add r15, {block_instrs}
-                        jmp rax
-
-                        .jit_resolve:
-                        mov rax, 1
-                        mov rbx, {target_pc}
-                        add r15, {block_instrs}
-                        ret
-
-                    "#, ret = ret,
-                        target_pc = target,
-                        store_rd_from_rax = store_reg!(inst.rd, "rax"),
-                        block_instrs = block_instrs,
-                        target = (target / 4) * 8);
-                    break 'next_inst;
-                }
-                0b1100111 => {
-                    // We know it's an Itype
-                    let inst = Itype::from(inst);
-
-                    match inst.funct3 {
-                        0b000 => {
-                            // JALR
-                            
-                            // Compute the return address
-                            let ret = pc.wrapping_add(4);
-                            
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                add rax, {imm}
-                                mov rdx, rax
-
-                                mov rbx, {ret}
-                                {store_rd_from_rbx}
-
-                                shr rax, 2
-                                cmp rax, {num_blocks}
-                                jae .jit_resolve
-                               
-                                mov  rax, [r14 + rax*8]
-                                test rax, rax
-                                jz   .jit_resolve
-
-                                add r15, {block_instrs}
-                                jmp rax
-
-                                .jit_resolve:
-                                mov rbx, rdx
-                                mov rax, 1
-                                add r15, {block_instrs}
-                                ret
-
-                            "#, imm = inst.imm,
-                                ret = ret,
-                                store_rd_from_rbx = store_reg!(inst.rd, "rbx"),
-                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                block_instrs = block_instrs,
-                                num_blocks = num_blocks);
-                            break 'next_inst;
-                        }
-                        _ => unimplemented!("Unexpected 0b1100111"),
-                    }
-                }
-                0b1100011 => {
-                    // We know it's an Btype
-                    let inst = Btype::from(inst);
-
-                    match inst.funct3 {
-                        0b000 | 0b001 | 0b100 | 0b101 | 0b110 | 0b111 => {
-                            let cond = match inst.funct3 {
-                                0b000 => /* BEQ  */ "jne",
-                                0b001 => /* BNE  */ "je",
-                                0b100 => /* BLT  */ "jnl",
-                                0b101 => /* BGE  */ "jnge",
-                                0b110 => /* BLTU */ "jnb",
-                                0b111 => /* BGEU */ "jnae",
-                                _ => unreachable!(),
-                            };
-
-                            let target =
-                                pc.wrapping_add(inst.imm as i64 as u64);
-                    
-                            if (target / 4) >= num_blocks as u64 {
-                                // Branch target is out of bounds
-                                panic!("JITOOB");
-                            }
-
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-
-                                cmp rax, rbx
-                                {cond} .fallthrough
-
-                                mov  rax, [r14 + {target}]
-                                test rax, rax
-                                jz   .jit_resolve
-
-                                add r15, {block_instrs}
-                                jmp rax
-                        
-                                .jit_resolve:
-                                mov rax, 1
-                                mov rbx, {target_pc}
-                                add r15, {block_instrs}
-                                ret
-                            
-                                .fallthrough:
-                            "#, cond = cond,
-                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                target_pc = target,
-                                block_instrs = block_instrs,
-                                target = (target / 4) * 8);
-                        }
-                        _ => unimplemented!("Unexpected 0b1100011"),
-                    }
-                }
-                0b0000011 => {
-                    // We know it's an Itype
-                    let inst = Itype::from(inst);
-
-                    let (loadtyp, loadsz, regtyp, access_size) =
-                            match inst.funct3 {
-                        0b000 => /* LB  */ ("movsx", "byte",  "rbx", 1),
-                        0b001 => /* LH  */ ("movsx", "word",  "rbx", 2),
-                        0b010 => /* LW  */ ("movsx", "dword", "rbx", 4),
-                        0b011 => /* LD  */ ("mov",   "qword", "rbx", 8),
-                        0b100 => /* LBU */ ("movzx", "byte",  "rbx", 1),
-                        0b101 => /* LHU */ ("movzx", "word",  "rbx", 2),
-                        0b110 => /* LWU */ ("mov",   "dword", "ebx", 4),
-                        _ => unreachable!(),
-                    };
-
-                    // Compute the read permission mask
-                    let mut perm_mask = 0u64;
-                    for ii in 0..access_size {
-                        perm_mask |= (PERM_READ as u64) << (ii * 8)
-                    }
-
-                    asm += &format!(r#"
-                        {load_rax_from_rs1}
-                        add rax, {imm}
-
-                        cmp rax, {memory_len} - {access_size}
-                        ja  .fault
-
-                        {loadtyp} {regtyp}, {loadsz} [r9 + rax]
-                        mov rcx, {perm_mask}
-                        and rbx, rcx
-                        cmp rbx, rcx
-                        je  .nofault
-
-                        .fault:
-                        mov rcx, rax
-                        mov rbx, {pc}
-                        mov rax, 4
-                        add r15, {block_instrs}
-                        ret
-
-                        .nofault:
-                        {loadtyp} {regtyp}, {loadsz} [r8 + rax]
-                        {store_rbx_into_rd}
-                    "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                        store_rbx_into_rd = store_reg!(inst.rd, "rbx"),
-                        loadtyp = loadtyp,
-                        loadsz = loadsz,
-                        regtyp = regtyp,
-                        pc = pc,
-                        access_size = access_size,
-                        block_instrs = block_instrs,
-                        perm_mask = perm_mask,
-                        memory_len = self.memory.len(),
-                        imm = inst.imm);
-                }
-                0b0100011 => {
-                    // We know it's an Stype
-                    let inst = Stype::from(inst);
-
-                    let (loadtyp, loadsz, regtype, loadrt, access_size) =
-                            match inst.funct3 {
-                        0b000 => /* SB */ ("movzx", "byte",  "bl",  "ebx", 1),
-                        0b001 => /* SH */ ("movzx", "word",  "bx",  "ebx", 2),
-                        0b010 => /* SW */ ("mov",   "dword", "ebx", "ebx", 4),
-                        0b011 => /* SD */ ("mov",   "qword", "rbx", "rbx", 8),
-                        _ => unreachable!(),
-                    };
-
-                    // Make sure the dirty block size is sane
-                    assert!(DIRTY_BLOCK_SIZE.count_ones() == 1 &&
-                            DIRTY_BLOCK_SIZE >= 8,
-                        "Dirty block size must be a power of two and >= 8");
-
-                    // Amount to shift to get the block from an address
-                    let dirty_block_shift = DIRTY_BLOCK_SIZE.trailing_zeros();
-                    
-                    // Compute the write permission mask
-                    let mut perm_mask = 0u64;
-                    for ii in 0..access_size {
-                        perm_mask |= (PERM_WRITE as u64) << (ii * 8)
-                    }
-
-                    asm += &format!(r#"
-                        {load_rax_from_rs1}
-                        add rax, {imm}
-
-                        cmp rax, {memory_len} - {access_size}
-                        ja  .fault
-
-                        {loadtyp} {loadrt}, {loadsz} [r9 + rax]
-                        mov rcx, {perm_mask}
-                        mov rdx, rbx
-                        and rbx, rcx
-                        cmp rbx, rcx
-                        je  .nofault
-
-                        .fault:
-                        mov rcx, rax
-                        mov rbx, {pc}
-                        mov rax, 5
-                        add r15, {block_instrs}
-                        ret
-
-                        .nofault:
-                        ; Get the raw bits and shift them into the read slot
-                        shl rcx, 2
-                        and rdx, rcx
-                        shr rdx, 3
-                        mov rbx, rdx
-                        or {loadsz} [r9 + rax], {regtype}
-
-                        mov rcx, rax
-                        shr rcx, {dirty_block_shift}
-                        bts qword [r11], rcx
-                        jc  .continue
-
-                        mov qword [r10 + r12*8], rcx
-                        add r12, 1
-
-                        .continue:
-                        {load_rbx_from_rs2}
-                        mov {loadsz} [r8 + rax], {regtype}
-                    "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                        load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                        loadtyp = loadtyp,
-                        loadsz = loadsz,
-                        regtype = regtype,
-                        imm = inst.imm,
-                        loadrt = loadrt,
-                        access_size = access_size,
-                        block_instrs = block_instrs,
-                        perm_mask = perm_mask,
-                        memory_len = self.memory.len(),
-                        pc = pc,
-                        dirty_block_shift = dirty_block_shift);
-                }
-                0b0010011 => {
-                    // We know it's an Itype
-                    let inst = Itype::from(inst);
-
-                    match inst.funct3 {
-                        0b000 => {
-                            // ADDI
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                add rax, {imm}
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
-                                imm = inst.imm);
-                        }
-                        0b010 => {
-                            // SLTI
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                xor  ebx, ebx
-                                cmp  rax, {imm}
-                                setl bl
-                                {store_rbx_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rbx_into_rd = store_reg!(inst.rd, "rbx"),
-                                imm = inst.imm);
-                        }
-                        0b011 => {
-                            // SLTIU
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                xor  ebx, ebx
-                                cmp  rax, {imm}
-                                setb bl
-                                {store_rbx_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rbx_into_rd = store_reg!(inst.rd, "rbx"),
-                                imm = inst.imm);
-                        }
-                        0b100 => {
-                            // XORI
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                xor rax, {imm}
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
-                                imm = inst.imm);
-                        }
-                        0b110 => {
-                            // ORI
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                or rax, {imm}
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
-                                imm = inst.imm);
-                        }
-                        0b111 => {
-                            // ANDI
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                and rax, {imm}
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
-                                imm = inst.imm);
-                        }
-                        0b001 => {
-                            let mode = (inst.imm >> 6) & 0b111111;
-                            
-                            match mode {
-                                0b000000 => {
-                                    // SLLI
-                                    let shamt = inst.imm & 0b111111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        shl rax, {imm}
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        0b101 => {
-                            let mode = (inst.imm >> 6) & 0b111111;
-                            
-                            match mode {
-                                0b000000 => {
-                                    // SRLI
-                                    let shamt = inst.imm & 0b111111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        shr rax, {imm}
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                0b010000 => {
-                                    // SRAI
-                                    let shamt = inst.imm & 0b111111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        sar rax, {imm}
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                0b0110011 => {
-                    // We know it's an Rtype
-                    let inst = Rtype::from(inst);
-
-                    match (inst.funct7, inst.funct3) {
-                        (0b0000000, 0b000) => {
-                            // ADD
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                add rax, rbx
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0100000, 0b000) => {
-                            // SUB
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                sub rax, rbx
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b001) => {
-                            // SLL
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                shl rax, cl
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b010) => {
-                            // SLT
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                xor  ecx, ecx
-                                cmp  rax, rbx
-                                setl cl
-                                {store_rcx_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rcx_into_rd = store_reg!(inst.rd, "rcx")
-                                );
-                        }
-                        (0b0000000, 0b011) => {
-                            // SLTU
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                xor  ecx, ecx
-                                cmp  rax, rbx
-                                setb cl
-                                {store_rcx_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rcx_into_rd = store_reg!(inst.rd, "rcx")
-                                );
-                        }
-                        (0b0000000, 0b100) => {
-                            // XOR
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                xor rax, rbx
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b101) => {
-                            // SRL
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                shr rax, cl
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0100000, 0b101) => {
-                            // SRA
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                sar rax, cl
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b110) => {
-                            // OR
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                or rax, rbx
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b111) => {
-                            // AND
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                and rax, rbx
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                0b0111011 => {
-                    // We know it's an Rtype
-                    let inst = Rtype::from(inst);
-
-                    match (inst.funct7, inst.funct3) {
-                        (0b0000000, 0b000) => {
-                            // ADDW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                add eax, ebx
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0100000, 0b000) => {
-                            // SUBW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rbx_from_rs2}
-                                sub eax, ebx
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rbx_from_rs2 = load_reg!("rbx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b001) => {
-                            // SLLW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                shl eax, cl
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0000000, 0b101) => {
-                            // SRLW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                shr eax, cl
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        (0b0100000, 0b101) => {
-                            // SRAW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                {load_rcx_from_rs2}
-                                sar eax, cl
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax")
-                                );
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                0b0001111 => {
-                    let inst = Itype::from(inst);
-
-                    match inst.funct3 {
-                        0b000 => {
-                            // FENCE
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                0b1110011 => {
-                    if inst == 0b00000000000000000000000001110011 {
-                        // ECALL
-                        asm += &format!(r#"
-                            mov rax, 2
-                            mov rbx, {pc}
-                            add r15, {block_instrs}
-                            ret
-                        "#, pc = pc, block_instrs = block_instrs);
-                    } else if inst == 0b00000000000100000000000001110011 {
-                        // EBREAK
-                        asm += &format!(r#"
-                            mov rax, 3
-                            mov rbx, {pc}
-                            add r15, {block_instrs}
-                            ret
-                        "#, pc = pc, block_instrs = block_instrs);
-                    } else {
-                        unreachable!();
-                    }
-                }
-                0b0011011 => {
-                    // We know it's an Itype
-                    let inst = Itype::from(inst);
-                    
-                    match inst.funct3 {
-                        0b000 => {
-                            // ADDIW
-                            asm += &format!(r#"
-                                {load_rax_from_rs1}
-                                add eax, {imm}
-                                movsx rax, eax
-                                {store_rax_into_rd}
-                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
-                                imm = inst.imm);
-                        }
-                        0b001 => {
-                            let mode = (inst.imm >> 5) & 0b1111111;
-                            
-                            match mode {
-                                0b0000000 => {
-                                    // SLLIW
-                                    let shamt = inst.imm & 0b11111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        shl eax, {imm}
-                                        movsx rax, eax
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        0b101 => {
-                            let mode = (inst.imm >> 5) & 0b1111111;
-                            
-                            match mode {
-                                0b0000000 => {
-                                    // SRLIW
-                                    let shamt = inst.imm & 0b11111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        shr eax, {imm}
-                                        movsx rax, eax
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                0b0100000 => {
-                                    // SRAIW
-                                    let shamt = inst.imm & 0b11111;
-                                    asm += &format!(r#"
-                                        {load_rax_from_rs1}
-                                        sar eax, {imm}
-                                        movsx rax, eax
-                                        {store_rax_into_rd}
-                                    "#, load_rax_from_rs1 =
-                                            load_reg!("rax", inst.rs1),
-                                        store_rax_into_rd =
-                                            store_reg!(inst.rd, "rax"),
-                                        imm = shamt);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                _ => {
-                    asm += &format!(r#"
-                        mov rax, 8
-                        mov rbx, {pc}
-                        add r15, {block_instrs}
-                        ret
-                    "#, pc = pc, block_instrs = block_instrs);
-                }
-            }
-
-            pc += 4;
-        }
-
-        Ok(asm)
-    }
-
-    pub fn test_jit(&mut self, pc: VirtAddr) -> Result<Vec<u8>, VmExit> {
+    /// Compile a JIT function for `pc` until all paths lead to indirect
+    /// jumps or calls
+    pub fn compile_jit(&mut self, pc: VirtAddr, corpus: &Corpus)
+            -> Result<Vec<u8>, VmExit> {
         let mut visited = BTreeSet::new();
         let mut queued = VecDeque::new();
         
@@ -2236,11 +1273,15 @@ enum _vmexit {
     Timeout,
     Breakpoint,
     InvalidOpcode,
+    Coverage,
 };
 
 struct _state {
     enum _vmexit exit_reason;
     uint64_t     reenter_pc;
+
+    uint64_t cov_from;
+    uint64_t cov_to;
 
     uint64_t regs[33];
     uint8_t *__restrict const memory;
@@ -2252,6 +1293,9 @@ struct _state {
     uint64_t *__restrict const trace_buffer;
     size_t trace_idx;
     const size_t trace_len;
+    uint64_t *const cov_bitmap;
+    uint64_t instrs_execed;
+    const uint64_t timeout;
 };
 
 extern "C" void start(struct _state *__restrict state) {
@@ -2300,6 +1344,44 @@ extern "C" void start(struct _state *__restrict state) {
         }
 
         while let Some(pc) = queued.pop_front() {
+            // Attempt to notify of a coverage edge ($from, $to)
+            // Note: This will cause the current instruction to be re-executed
+            // if the coverage is new. Thus, it is critical that no side
+            // effects occur prior to the coverage_event!() macro use.
+            macro_rules! coverage_event {
+                ($from:expr, $to:expr) => {
+                    let coverage_bitmap_bits =
+                        size_of_val(corpus.coverage_bitmap.as_slice()) * 8;
+                    assert!(coverage_bitmap_bits.count_ones() == 1,
+                        "Coverage bitmap must be a power of two");
+                    program += &format!(r#"
+        if (state->instrs_execed > state->timeout) {{
+            state->exit_reason = Timeout;
+            state->reenter_pc  = {pc:#x}ULL;
+            return;
+        }}
+
+        auto hash = ({from} ^ 0xe66dd519dba260bbULL) ^
+            ({to} ^ 0xa50ec1c4a4065d15ULL);
+        hash ^= hash << 13;
+        hash ^= hash >> 17;
+        hash ^= hash << 43;
+        hash &= {hashmask};
+        auto idx = hash / 64;
+        auto bit = 1ULL << (hash % 64);
+        if ((state->cov_bitmap[idx] & bit) == 0) {{
+            state->cov_bitmap[idx] |= bit;
+            state->exit_reason = Coverage;
+            state->cov_from    = {from};
+            state->cov_to      = {to};
+            state->reenter_pc  = {pc:#x}ULL;
+            return;
+        }}
+    "#, from = $from, to = $to, hashmask = coverage_bitmap_bits - 1,
+        pc = pc.0);
+                }
+            }
+
             if !visited.insert(pc) {
                 // Already JITted this PC
                 continue;
@@ -2317,8 +1399,9 @@ extern "C" void start(struct _state *__restrict state) {
 
             // Create the instruction start label
             program += &format!("inst_{:016x}: {{\n", pc.0);
-            
-            print!("Lifting {:x?}\n", pc);
+
+            // Update instructions executed stats
+            program += "    state->instrs_execed += 1;\n";
             
             if ENABLE_TRACING {
                 program += &format!(r#"
@@ -2364,6 +1447,13 @@ extern "C" void start(struct _state *__restrict state) {
                     let inst = Jtype::from(inst);
                     let retaddr = pc.0.wrapping_add(4);
                     let target  = pc.0.wrapping_add(inst.imm as i64 as usize);
+
+                    // Record coverage
+                    coverage_event!(
+                        format!("{:#x}ULL", pc.0),
+                        format!("{:#x}ULL", target));
+
+                    // Set the return address
                     set_reg!(inst.rd, retaddr);
 
                     if inst.rd == Register::Zero {
@@ -2396,7 +1486,15 @@ extern "C" void start(struct _state *__restrict state) {
                             get_reg!("auto target", inst.rs1);
                             program += &format!("    target += {:#x}ULL;\n",
                                 inst.imm as i64 as u64);
+
+                            // Record coverage
+                            coverage_event!(
+                                format!("{:#x}ULL", pc.0),
+                                "target");
+
+                            // Set the return address
                             set_reg!(inst.rd, retaddr);
+
                             program +=
                                 "    state->exit_reason = IndirectBranch;\n";
                             program +=
@@ -2429,9 +1527,20 @@ extern "C" void start(struct _state *__restrict state) {
                     get_reg!("auto rs2", inst.rs2);
                     program += &format!("    if (({})rs1 {} ({})rs2) {{\n",
                         cmptyp, cmpop, cmptyp);
+
+                    // Record coverage for true condition
+                    coverage_event!(
+                        format!("{:#x}ULL", pc.0),
+                        format!("{:#x}ULL", target));
+
                     program +=
                         &format!("        goto inst_{:016x};\n", target);
                     program += "    }\n";
+                    
+                    // Record coverage for false condition
+                    coverage_event!(
+                        format!("{:#x}ULL", pc.0),
+                        format!("{:#x}ULL", pc.0.wrapping_add(4)));
 
                     // Queue exploration of this target
                     queued.push_back(VirtAddr(target));
@@ -2464,13 +1573,12 @@ extern "C" void start(struct _state *__restrict state) {
 
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
-                    /*
     if(addr > {}ULL - sizeof({}) ||
             (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
         state->exit_reason = ReadFault;
         state->reenter_pc  = {:#x}ULL;
         return;
-    }}*/
+    }}
     "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0);
 
                     set_reg!(inst.rd, format!("*({}*)(state->memory + addr)",
@@ -2505,7 +1613,6 @@ extern "C" void start(struct _state *__restrict state) {
                     
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
-                    /*
     if(addr > {}ULL - sizeof({}) ||
             (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
         state->exit_reason = WriteFault;
@@ -2516,13 +1623,14 @@ extern "C" void start(struct _state *__restrict state) {
     // Enable reads for memory with RAW set
     auto perms = *({}*)(state->permissions + addr);
     perms &= {:#x}ULL;
-    *({}*)(state->permissions + addr) |= perms >> 3;*/
+    *({}*)(state->permissions + addr) |= perms >> 3;
 
     auto block = addr / {};
     auto idx   = block / 64;
-    auto bit   = 1 << (block % 64);
+    auto bit   = 1ULL << (block % 64);
     if((state->dirty_bitmap[idx] & bit) == 0) {{
         state->dirty[state->dirty_idx++] = block;
+        state->dirty_bitmap[idx] |= bit;
     }}
     "#, self.memory.len(),
         storetyp, storetyp, perm_mask, perm_mask, pc.0, storetyp, raw_mask,
@@ -2816,6 +1924,39 @@ extern "C" void start(struct _state *__restrict state) {
 
         // Close the function scope
         program += "}\n";
+        
+        // Hash the C++ file contents
+        let proghash = corpus.hasher.hash(program.as_bytes());
+
+        // Check if we're the first core to try to compile this
+        let first = {
+            let mut jobs = corpus.compile_jobs.lock().unwrap();
+            jobs.insert(proghash)
+        };
+        
+        // Create the jitcache folder
+        std::fs::create_dir_all("jitcache")
+            .expect("Failed to create jitcache directory");
+
+        // Create the cache name
+        let cachename = Path::new("jitcache")
+            .join(format!("{:032x}", proghash));
+
+        // If we aren't the first to access the cache, idle loop until the
+        // first person has compiled the code
+        if !first {
+            while !cachename.exists() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        // If the cache exists, read the cache
+        if cachename.exists() {
+            return Ok(std::fs::read(&cachename)
+                .expect("Failed to read file from jit cache"));
+        }
+        
+        print!("Compiling cache for {:#018x} -> {:032x}\n", pc.0, proghash);
 
         let cppfn = std::env::temp_dir().join(
             format!("fwetmp_{:?}.cpp",
@@ -2838,7 +1979,7 @@ extern "C" void start(struct _state *__restrict state) {
             "-Wno-unused-label",
             "-Wno-unused-variable",
             "-Werror",
-            //"-fno-strict-aliasing",
+            "-fno-strict-aliasing",
             "-static", "-nostdlib", "-ffreestanding",
             "-Wl,-Tldscript.ld", "-Wl,--gc-sections", "-Wl,--build-id=none",
             "-o", linkfn.to_str().unwrap(),
@@ -2854,7 +1995,11 @@ extern "C" void start(struct _state *__restrict state) {
             .expect("Failed to launch objcopy");
         assert!(res.success(), "objcopy returned error");
 
-        Ok(std::fs::read(&binfn).expect("Failed to read JIT code"))
+        // Move the compiled output to the cache
+        std::fs::rename(&binfn, &cachename)
+            .expect("Failed to rename compiled JIT to cache file");
+
+        Ok(std::fs::read(&cachename).expect("Failed to read JIT code"))
     }
 }
 
