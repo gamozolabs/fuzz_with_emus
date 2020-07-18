@@ -427,6 +427,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
           stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
     // Create a new random number generator
     let mut rng = Rng::new();
+    print!("{}\n", rng.rand());
 
     loop {
         // Start a timer
@@ -448,14 +449,16 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
             emu.fuzz_input.clear();
 
             // Pick a random file from the corpus as an input
-            let sel = rng.rand() % corpus.inputs.len();
+            let sel = 0; //rng.rand() % corpus.inputs.len();
             if let Some(input) = corpus.inputs.get(sel) {
                 emu.fuzz_input.extend_from_slice(input);
             }
 
+            assert!(emu.fuzz_input.len() == 14680);
+            
             /*
             if emu.fuzz_input.len() > 0 {
-                for _ in 0..rng.rand() % 32 {
+                for _ in 0..rng.rand() % 128 {
                     let sel = rng.rand() % emu.fuzz_input.len();
                     emu.fuzz_input[sel] = rng.rand() as u8;
                 }
@@ -625,6 +628,10 @@ fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     Ok(())
 }
 
+fn _end_case(_emu: &mut Emulator) -> Result<(), VmExit> {
+    Err(VmExit::Exit)
+}
+
 fn main() -> io::Result<()> {
     std::fs::create_dir_all("inputs")?;
     std::fs::create_dir_all("crashes")?;
@@ -659,30 +666,31 @@ fn main() -> io::Result<()> {
 
     // Load the application into the emulator
     if true {
-        emu.memory.load("./objdump", &[
+        emu.memory.load("./objdump_riscv", &[
             Section {
                 file_off:    0x0000000000000000,
                 virt_addr:   VirtAddr(0x0000000000010000),
-                file_size:   0x000000000023bfe8,
-                mem_size:    0x000000000023bfe8,
+                file_size:   0x000000000020a1b8,
+                mem_size:    0x000000000020a1b8,
                 permissions: Perm(PERM_READ | PERM_EXEC),
             },
             Section {
-                file_off:    0x000000000023c000,
-                virt_addr:   VirtAddr(0x24c000),
-                file_size:   0x0000000000008a52,
-                mem_size:    0x00000000000104a8,
+                file_off:    0x000000000020a1b8,
+                virt_addr:   VirtAddr(0x21b1b8),
+                file_size:   0x0000000000008332,
+                mem_size:    0x000000000000fd98,
                 permissions: Perm(PERM_READ | PERM_WRITE),
             },
         ]).expect("Failed to load test application into address space");
 
-        emu.add_breakpoint(VirtAddr(0x1136e4), malloc_bp);
-        emu.add_breakpoint(VirtAddr(0x110740), calloc_bp);
-        emu.add_breakpoint(VirtAddr(0x111b24), free_bp);
-        emu.add_breakpoint(VirtAddr(0x115ac8), realloc_bp);
+        emu.add_breakpoint(VirtAddr(0x1151d0), malloc_bp);
+        emu.add_breakpoint(VirtAddr(0x1120e8), calloc_bp);
+        emu.add_breakpoint(VirtAddr(0x113610), free_bp);
+        emu.add_breakpoint(VirtAddr(0x117930), realloc_bp);
+        //emu.add_breakpoint(VirtAddr(0x1c1f0), _end_case);
         
         // Set the program entry point
-        emu.set_reg(Register::Pc, 0x10980);
+        emu.set_reg(Register::Pc, 0x109a4);
     } else {
         emu.memory.load("./objdump_old", &[
             Section {
@@ -743,16 +751,16 @@ fn main() -> io::Result<()> {
     push!(progname.0); // Argv
     push!(3u64);   // Argc
 
-    /*
     loop {
         // Run the emulator to a certain point
         let mut tmp = 0;
-        let vmexit = emu.run(&mut tmp, &*corpus)
+        let vmexit = emu.run_emu(&mut tmp, &*corpus)
             .expect_err("Failed to execute emulator");
 
         match vmexit {
             VmExit::Syscall => {
-                if emu.reg(Register::A7) == 1038 {
+                print!("Syscall {}\n", emu.reg(Register::A7));
+                if emu.reg(Register::A7) == 1024 {
                     break;
                 }
 
@@ -766,9 +774,9 @@ fn main() -> io::Result<()> {
             }
             _ => break,
         }
-    }*/
+    }
 
-    print!("Took snapshot\n");
+    print!("Took snapshot at {:#x}\n", emu.reg(Register::Pc));
 
     // Wrap the original emulator in an `Arc`
     let emu = Arc::new(emu);

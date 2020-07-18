@@ -43,6 +43,7 @@ pub struct Section {
     pub permissions: Perm,
 }
 
+#[derive(PartialEq)]
 /// An isolated memory space
 pub struct Mmu {
     /// Block of memory for this address space
@@ -121,6 +122,14 @@ impl Mmu {
         // Clear active allocation state
         self.active_alcs.clear();
         self.active_alcs.extend(other.active_alcs.iter());
+
+        if false {
+            // Tests to make sure everything to reset perfectly
+            assert!(self.cur_alc == other.cur_alc);
+            assert!(self.memory == other.memory);
+            assert!(self.permissions == other.permissions);
+            assert!(self.active_alcs == other.active_alcs);
+        }
     }
 
     /// Allocate a region of memory as RW in the address space
@@ -188,6 +197,25 @@ impl Mmu {
         // Apply permissions
         self.permissions.get_mut(addr.0..addr.0.checked_add(size)?)?
             .iter_mut().for_each(|x| *x = perm);
+        
+        // Compute dirty bit blocks
+        let block_start = addr.0 / DIRTY_BLOCK_SIZE;
+        let block_end   = (addr.0 + size) / DIRTY_BLOCK_SIZE;
+        for block in block_start..=block_end {
+            // Determine the bitmap position of the dirty block
+            let idx = block / 64;
+            let bit = block % 64;
+            
+            // Check if the block is not dirty
+            if self.dirty_bitmap[idx] & (1 << bit) == 0 {
+                // Block is not dirty, add it to the dirty list
+                self.dirty.push(block);
+
+                // Update the dirty bitmap
+                self.dirty_bitmap[idx] |= 1 << bit;
+            }
+        }
+
         Some(())
     }
 

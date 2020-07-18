@@ -108,6 +108,7 @@ impl JitCache {
     }
 
     /// Look up the JIT address for a given guest address
+    #[inline]
     pub fn lookup(&self, addr: VirtAddr) -> Option<usize> {
         // Make sure the address is aligned
         if addr.0 & 3 != 0 {
@@ -138,10 +139,14 @@ impl JitCache {
             return existing;
         }
 
+        // Compute the aligned size of code, this ensures we can do aligned
+        // vector operations because we ensure alignment of loaded JITs
+        let align_size = (code.len() + 0x3f) & !0x3f;
+
         // Number of remaining bytes in the JIT storage
         let jit_inuse  = jit.1;
         let jit_remain = jit.0.len() - jit_inuse;
-        assert!(jit_remain > code.len(), "Out of space in JIT");
+        assert!(jit_remain > align_size, "Out of space in JIT");
 
         // Copy the new code into the JIT
         jit.0[jit_inuse..jit_inuse + code.len()].copy_from_slice(code);
@@ -153,7 +158,7 @@ impl JitCache {
         self.blocks[addr.0 / 4].store(new_addr, Ordering::SeqCst);
 
         // Update the in use for the JIT
-        jit.1 += code.len();
+        jit.1 += align_size;
 
         //print!("Added jit for {:#x} -> {:#x}\n", addr.0, new_addr);
 

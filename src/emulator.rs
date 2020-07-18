@@ -3,17 +3,49 @@
 use std::fmt;
 use std::sync::Arc;
 use std::process::Command;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::rdtsc;
 use crate::Corpus;
-use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC};
+use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC, PERM_RAW};
 use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE};
 use crate::jitcache::JitCache;
 
 /// If set, all register state will be saved before the execution of every
 /// instruction.
 /// This is INCREDIBLY slow and should only be used for debugging
-const ENABLE_TRACING: bool = true;
+const ENABLE_TRACING: bool = false;
+
+/// Make sure this stays in sync with the C++ JIT version of this structure
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitReason {
+    None,
+    IndirectBranch,
+    ReadFault,
+    WriteFault,
+    Ecall,
+    Ebreak,
+    Timeout,
+    Breakpoint,
+    InvalidOpcode,
+}
+
+/// Make sure this stays in sync with the C++ JIT version of this structure
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuestState {
+    exit_reason:  ExitReason,
+    reenter_pc:   u64,
+    regs:         [u64; 33],
+    memory:       usize,
+    permissions:  usize,
+    dirty:        usize,
+    dirty_idx:    usize,
+    dirty_bitmap: usize,
+    trace_buffer: usize,
+    trace_idx:    usize,
+    trace_len:    usize,
+}
 
 /// An R-type instruction
 #[derive(Debug)]
@@ -183,7 +215,7 @@ pub struct Emulator {
     pub memory: Mmu,
 
     /// All RV64i registers
-    registers: [u64; 33],
+    state: GuestState,
 
     /// Fuzz input for the program
     pub fuzz_input: Vec<u8>,
@@ -210,6 +242,9 @@ pub enum VmExit {
 
     /// The VM exited cleanly as requested by the VM
     Exit,
+
+    /// A RISC-V software breakpoint instruction was hit
+    Ebreak,
 
     /// The instruction count limit was hit and a timeout has occurred
     Timeout,
@@ -391,7 +426,7 @@ pub enum Register {
 
 impl From<u32> for Register {
     fn from(val: u32) -> Self {
-        assert!(val < 32);
+        assert!(val < 33);
         unsafe {
             core::ptr::read_unaligned(&(val as usize) as
                                       *const usize as *const Register)
@@ -402,9 +437,23 @@ impl From<u32> for Register {
 impl Emulator {
     /// Creates a new emulator with `size` bytes of memory
     pub fn new(size: usize) -> Self {
+        assert!(size >= 8, "Must have at least 8 bytes of memory");
+
         Emulator {
-            memory:     Mmu::new(size),
-            registers:  [0; 33],
+            memory: Mmu::new(size),
+            state:  GuestState {
+                exit_reason:  ExitReason::None,
+                reenter_pc:   0,
+                regs:         [0; 33],
+                memory:       0,
+                permissions:  0,
+                dirty:        0,
+                dirty_idx:    0,
+                dirty_bitmap: 0,
+                trace_buffer: 0,
+                trace_idx:    0,
+                trace_len:    0,
+            },
             fuzz_input: Vec::new(),
             files: Files(vec![
                 Some(EmuFile::Stdin),
@@ -422,7 +471,7 @@ impl Emulator {
     pub fn fork(&self) -> Self {
         Emulator {
             memory:      self.memory.fork(),
-            registers:   self.registers.clone(),
+            state:       self.state.clone(),
             fuzz_input:  self.fuzz_input.clone(),
             files:       self.files.clone(),
             jit_cache:   self.jit_cache.clone(),
@@ -447,23 +496,33 @@ impl Emulator {
     /// Reset the state of `self` to `other`, assuming that `self` is
     /// forked off of `other`. If it is not, the results are invalid.
     pub fn reset(&mut self, other: &Self) {
+        if ENABLE_TRACING {
+            let mut tracestr = String::new();
+            let mut pctracestr = String::new();
+            for trace in &self.trace {
+                self.state.regs = *trace;
+                tracestr += &format!("{}\n", self);
+                pctracestr += &format!("{:x}\n", self.reg(Register::Pc));
+            }
+            if self.trace.len() > 0 {
+                std::fs::write("trace.txt", tracestr).unwrap();
+                std::fs::write("pctrace.txt", pctracestr).unwrap();
+                panic!();
+            }
+        
+            // Reset trace state
+            self.trace.clear();
+        }
+
         // Reset memory state
         self.memory.reset(&other.memory);
 
         // Reset register state
-        self.registers = other.registers;
+        self.state.regs = other.state.regs;
 
         // Reset file state
         self.files.0.clear();
         self.files.0.extend_from_slice(&other.files.0);
-
-        for trace in &self.trace {
-            //print!("{:?}\n", trace);
-        }
-        print!("{}\n", self.trace.len());
-
-        // Reset trace state
-        self.trace.clear();
     }
 
     /// Allocate a new file descriptor
@@ -484,7 +543,7 @@ impl Emulator {
     /// Get a register from the guest
     pub fn reg(&self, register: Register) -> u64 {
         if register != Register::Zero {
-            self.registers[register as usize]
+            self.state.regs[register as usize]
         } else {
             0
         }
@@ -493,7 +552,7 @@ impl Emulator {
     /// Set a register in the guest
     pub fn set_reg(&mut self, register: Register, val: u64) {
         if register != Register::Zero {
-            self.registers[register as usize] = val;
+            self.state.regs[register as usize] = val;
         }
     }
 
@@ -529,6 +588,25 @@ impl Emulator {
                                                    Perm(PERM_EXEC))
                 .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
 
+            //print!("Executing {:#x}\n", pc);
+            if ENABLE_TRACING {
+                self.trace.push(self.state.regs);
+            }
+            
+            // Update code coverage
+            corpus.code_coverage.entry_or_insert(
+                &VirtAddr(pc as usize), pc as usize, || {
+                    // Save the input and log it in the hash table
+                    let hash = corpus.hasher.hash(&self.fuzz_input);
+                    corpus.input_hashes.entry_or_insert(
+                            &hash, hash as usize, || {
+                        corpus.inputs.push(Box::new(self.fuzz_input.clone()));
+                        Box::new(())
+                    });
+
+                    Box::new(())
+                });
+
             if let Some(callback) =
                     self.breakpoints.get(&VirtAddr(pc as usize)) {
                 // Invoke the breakpoint callback
@@ -545,20 +623,6 @@ impl Emulator {
 
             // Extract the opcode from the instruction
             let opcode = inst & 0b1111111;
-
-            // Update code coverage
-            corpus.code_coverage.entry_or_insert(
-                &VirtAddr(pc as usize), pc as usize, || {
-                    // Save the input and log it in the hash table
-                    let hash = corpus.hasher.hash(&self.fuzz_input);
-                    corpus.input_hashes.entry_or_insert(
-                            &hash, hash as usize, || {
-                        corpus.inputs.push(Box::new(self.fuzz_input.clone()));
-                        Box::new(())
-                    });
-
-                    Box::new(())
-                });
 
             //print!("{}\n\n", self);
 
@@ -1019,7 +1083,7 @@ impl Emulator {
         let mut override_jit_addr = None;
 
         loop {
-            let jit_addr = if let Some(override_jit_addr) =
+            let mut jit_addr = if let Some(override_jit_addr) =
                     override_jit_addr.take() {
                 override_jit_addr
             } else {
@@ -1036,12 +1100,10 @@ impl Emulator {
                 if let Some(jit_addr) = jit_addr {
                     jit_addr
                 } else {
-                    // Go through each instruction in the block, and accumulate
-                    // an assembly string which we will assemble using `nasm`
-                    // om the command line
-                    let asm = self.generate_jit(
-                        VirtAddr(pc as usize), num_blocks, corpus)?;
+                    // Generate the JIT for this PC
+                    let tmp = self.test_jit(VirtAddr(pc as usize))?;
 
+                    /*
                     // Write out the assembly
                     let asmfn = std::env::temp_dir().join(
                         format!("fwetmp_{:?}.asm",
@@ -1062,7 +1124,7 @@ impl Emulator {
 
                     // Read the binary
                     let tmp = std::fs::read(&binfn)
-                        .expect("Failed to read nasm output");
+                        .expect("Failed to read nasm output");*/
 
                     // Update the JIT tables
                     self.jit_cache.as_ref().unwrap().add_mapping(
@@ -1070,6 +1132,110 @@ impl Emulator {
                 }
             };
 
+            // Set up the JIT state
+            self.state.memory       = memory;
+            self.state.permissions  = perms;
+            self.state.dirty        = dirty;
+            self.state.dirty_idx    = self.memory.dirty_len();
+            self.state.dirty_bitmap = dirty_bitmap;
+            self.state.trace_buffer = self.trace.as_ptr() as usize;
+            self.state.trace_idx    = self.trace.len();
+            self.state.trace_len    = self.trace.capacity();
+                    
+            let jit_cache = self.jit_cache.as_ref().unwrap();
+
+            'quick_reenter: loop { 
+                unsafe {
+                    // Create a function pointer to the JIT
+                    let func =
+                        *(&jit_addr as *const usize as
+                          *const fn(&mut GuestState));
+                    func(&mut self.state);
+
+                    // Quickly check if this is an indirect branch
+                    if self.state.exit_reason == ExitReason::IndirectBranch {
+                        // Check if we already know the JIT address of the
+                        // branch target
+                        if let Some(ent) =
+                                jit_cache.lookup(
+                                    VirtAddr(self.state.reenter_pc as usize)) {
+                            jit_addr = ent;
+                            continue 'quick_reenter;
+                        }
+                    }
+
+                    // Either it was not an indirect branch, or we need to lift
+                    // the target
+                    break 'quick_reenter;
+                }
+            }
+                    
+            // Update the PC reentry point
+            self.set_reg(Register::Pc, self.state.reenter_pc);
+                    
+            unsafe {
+                // Update trace length
+                self.trace.set_len(self.state.trace_idx);
+            
+                // Update the dirty state
+                self.memory.set_dirty_len(self.state.dirty_idx);
+            }
+
+            match self.state.exit_reason {
+                ExitReason::None => unreachable!(),
+                ExitReason::IndirectBranch => {
+                    // Just fall through to translate to JIT
+                }
+                ExitReason::Ebreak => {
+                    // RISC-V breakpoint instruction
+                    return Err(VmExit::Ebreak);
+                }
+                ExitReason::Ecall => {
+                    // Syscall
+                    return Err(VmExit::Syscall);
+                }
+                ExitReason::ReadFault => {
+                    // Read fault
+                    // The JIT reports the address of the base of the
+                    // access, invoke the emulator to get the specific
+                    // byte which caused the fault
+                    return self.run_emu(instrs_execed, corpus);
+                }
+                ExitReason::WriteFault => {
+                    // Write fault
+                    // The JIT reports the address of the base of the
+                    // access, invoke the emulator to get the specific
+                    // byte which caused the fault
+                    return self.run_emu(instrs_execed, corpus);
+                }
+                ExitReason::Timeout => {
+                    // Hit the instruction count timeout
+                    return Err(VmExit::Timeout);
+                }
+                ExitReason::Breakpoint => {
+                    // Hit breakpoint, invoke callback
+                    let pc = VirtAddr(self.state.reenter_pc as usize);
+                    if let Some(callback) = self.breakpoints.get(&pc) {
+                        callback(self)?;
+                    }
+
+                    if self.reg(Register::Pc) == self.state.reenter_pc {
+                        // Force execution at the return location, which
+                        // will skip over the breakpoint return
+                        panic!("WAT");
+                    } else {
+                        // PC was changed by the breakpoint handler,
+                        // thus we respect its change and will jump
+                        // to the target it specified
+                    }
+                }
+                ExitReason::InvalidOpcode => {
+                    // An invalid opcode was executed
+                    return Err(VmExit::InvalidOpcode);
+                }
+            }
+
+            /*
             unsafe {
                 // Invoke the jit
                 let exit_code:  u64;
@@ -1108,7 +1274,7 @@ impl Emulator {
                 in("r10") dirty,
                 in("r11") dirty_bitmap,
                 inout("r12") dirty_inuse => new_dirty_inuse,
-                in("r13") self.registers.as_ptr(),
+                in("r13") self.state.regs.as_ptr(),
                 in("r14") trans_table,
                 inout("r15") instcount,
                 );
@@ -1176,7 +1342,7 @@ impl Emulator {
                     }
                     _ => unreachable!(),
                 }
-            }
+            }*/
         }
     }
 
@@ -2045,6 +2211,650 @@ impl Emulator {
         }
 
         Ok(asm)
+    }
+
+    pub fn test_jit(&mut self, pc: VirtAddr) -> Result<Vec<u8>, VmExit> {
+        let mut visited = BTreeSet::new();
+        let mut queued = VecDeque::new();
+        
+        // Insert the program counter into the queue
+        queued.push_back(pc);
+
+        let mut program = String::new();
+        program += 
+r#"
+#include <stddef.h>
+#include <stdint.h>
+
+enum _vmexit {
+    None,
+    IndirectBranch,
+    ReadFault,
+    WriteFault,
+    Ecall,
+    Ebreak,
+    Timeout,
+    Breakpoint,
+    InvalidOpcode,
+};
+
+struct _state {
+    enum _vmexit exit_reason;
+    uint64_t     reenter_pc;
+
+    uint64_t regs[33];
+    uint8_t *__restrict const memory;
+    uint8_t *__restrict const permissions;
+    uintptr_t *__restrict const dirty;
+    size_t dirty_idx;
+    uint64_t *__restrict const dirty_bitmap;
+
+    uint64_t *__restrict const trace_buffer;
+    size_t trace_idx;
+    const size_t trace_len;
+};
+
+extern "C" void start(struct _state *__restrict state) {
+"#;
+
+        macro_rules! set_reg {
+            ($reg:expr, $expr:expr) => {
+                if $reg != Register::Zero {
+                    program += &format!("    state->regs[{}] = {};\n",
+                        $reg as usize, $expr);
+                }
+            }
+        }
+        
+        macro_rules! get_reg {
+            ($expr:expr, $reg:expr) => {
+                if $reg == Register::Zero {
+                    program += &format!("    {} = 0x0ULL;\n", $expr);
+                } else {
+                    program += &format!("    {} = state->regs[{}];\n",
+                        $expr, $reg as usize);
+                }
+            }
+        }
+        
+        macro_rules! set_regw {
+            ($reg:expr, $expr:expr) => {
+                if $reg != Register::Zero {
+                    program +=
+                        &format!("    state->regs[{}] = (int32_t)({});\n",
+                        $reg as usize, $expr);
+                }
+            }
+        }
+        
+        macro_rules! get_regw {
+            ($expr:expr, $reg:expr) => {
+                if $reg == Register::Zero {
+                    program += &format!("    {} = 0x0U;\n", $expr);
+                } else {
+                    program +=
+                        &format!("    {} = (uint32_t)state->regs[{}];\n",
+                        $expr, $reg as usize);
+                }
+            }
+        }
+
+        while let Some(pc) = queued.pop_front() {
+            if !visited.insert(pc) {
+                // Already JITted this PC
+                continue;
+            }
+
+            // Check alignment
+            if pc.0 & 3 != 0 {
+                // Code was unaligned, return a code fetch fault
+                return Err(VmExit::ExecFault(pc));
+            }
+
+            // Read the instruction
+            let inst: u32 = self.memory.read_perms(pc, Perm(PERM_EXEC))
+                .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
+
+            // Create the instruction start label
+            program += &format!("inst_{:016x}: {{\n", pc.0);
+            
+            print!("Lifting {:x?}\n", pc);
+            
+            if ENABLE_TRACING {
+                program += &format!(r#"
+    if (state->trace_idx >= state->trace_len) {{
+        __builtin_trap();
+    }}
+    for(int ii = 0; ii < 32; ii++) {{
+        state->trace_buffer[state->trace_idx * 33 + ii] = state->regs[ii];
+    }}
+    state->trace_buffer[state->trace_idx * 33 + 32] = {:#x}ULL;
+    state->trace_idx++;
+"#, pc.0);
+            }
+            
+            // Insert breakpoint if needed
+            if self.breakpoints.contains_key(&pc) {
+                program += &format!(r#"
+    state->exit_reason = Breakpoint;
+    state->reenter_pc  = {:#x}ULL;
+    return;
+"#, pc.0);
+            }
+
+            // Extract the opcode from the instruction
+            let opcode = inst & 0b1111111;
+
+            match opcode {
+                0b0110111 => {
+                    // LUI
+                    let inst = Utype::from(inst);
+                    set_reg!(inst.rd,
+                             format!("{:#x}ULL", inst.imm as i64 as u64));
+                }
+                0b0010111 => {
+                    // AUIPC
+                    let inst = Utype::from(inst);
+                    let val =
+                        (inst.imm as i64 as u64).wrapping_add(pc.0 as u64);
+                    set_reg!(inst.rd, format!("{:#x}ULL", val));
+                }
+                0b1101111 => {
+                    // JAL
+                    let inst = Jtype::from(inst);
+                    let retaddr = pc.0.wrapping_add(4);
+                    let target  = pc.0.wrapping_add(inst.imm as i64 as usize);
+                    set_reg!(inst.rd, retaddr);
+
+                    if inst.rd == Register::Zero {
+                        // Unconditional branch == jal with an rd = zero
+                        program += &format!("goto inst_{:016x};\n", target);
+                        queued.push_back(VirtAddr(target));
+                    } else {
+                        // Function call, treat as an indirect branch to
+                        // avoid inlining boatloads of function calls into
+                        // their parents.
+                        program +=
+                            "    state->exit_reason = IndirectBranch;\n";
+                        program +=
+                            &format!("    state->reenter_pc = {:#x}ULL;\n",
+                                target);
+                        program += "    return;\n";
+                    }
+
+                    program += "}\n";
+                    continue;
+                }
+                0b1100111 => {
+                    // We know it's an Itype
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // JALR
+                            let retaddr = pc.0.wrapping_add(4);
+                            get_reg!("auto target", inst.rs1);
+                            program += &format!("    target += {:#x}ULL;\n",
+                                inst.imm as i64 as u64);
+                            set_reg!(inst.rd, retaddr);
+                            program +=
+                                "    state->exit_reason = IndirectBranch;\n";
+                            program +=
+                                "    state->reenter_pc = target;\n";
+                            program += "    return;\n";
+                            program += "}\n";
+                            continue;
+                        }
+                        _ => unimplemented!("Unexpected 0b1100111"),
+                    }
+                }
+                0b1100011 => {
+                    // We know it's an Btype
+                    let inst = Btype::from(inst);
+
+                    let (cmptyp, cmpop) = match inst.funct3 {
+                        0b000 => /* BEQ  */ ("int64_t",  "=="),
+                        0b001 => /* BNE  */ ("int64_t",  "!="),
+                        0b100 => /* BLT  */ ("int64_t",  "<"),
+                        0b101 => /* BGE  */ ("int64_t",  ">="),
+                        0b110 => /* BLTU */ ("uint64_t", "<"),
+                        0b111 => /* BGEU */ ("uint64_t", ">="),
+                        _ => unimplemented!("Unexpected 0b1100011"),
+                    };
+
+                    // Compute branch target
+                    let target = pc.0.wrapping_add(inst.imm as i64 as usize);
+
+                    get_reg!("auto rs1", inst.rs1);
+                    get_reg!("auto rs2", inst.rs2);
+                    program += &format!("    if (({})rs1 {} ({})rs2) {{\n",
+                        cmptyp, cmpop, cmptyp);
+                    program +=
+                        &format!("        goto inst_{:016x};\n", target);
+                    program += "    }\n";
+
+                    // Queue exploration of this target
+                    queued.push_back(VirtAddr(target));
+                }
+                0b0000011 => {
+                    // We know it's an Itype
+                    let inst = Itype::from(inst);
+                     
+                    let (loadtyp, access_size) = match inst.funct3 {
+                        0b000 => /* LB  */ ("int8_t",   1),
+                        0b001 => /* LH  */ ("int16_t",  2),
+                        0b010 => /* LW  */ ("int32_t",  4),
+                        0b011 => /* LD  */ ("int64_t",  8),
+                        0b100 => /* LBU */ ("uint8_t",  1),
+                        0b101 => /* LHU */ ("uint16_t", 2),
+                        0b110 => /* LWU */ ("uint32_t", 4),
+                        _ => unreachable!(),
+                    };
+                    
+                    // Compute the read permission mask
+                    let mut perm_mask = 0u64;
+                    for ii in 0..access_size {
+                        perm_mask |= (PERM_READ as u64) << (ii * 8)
+                    }
+
+                    // Compute the address
+                    get_reg!("auto addr", inst.rs1);
+                    program += &format!("    addr += {:#x}ULL;\n",
+                        inst.imm as i64 as u64);
+
+                    // Check the bounds and permissions of the address
+                    program += &format!(r#"
+                    /*
+    if(addr > {}ULL - sizeof({}) ||
+            (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
+        state->exit_reason = ReadFault;
+        state->reenter_pc  = {:#x}ULL;
+        return;
+    }}*/
+    "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0);
+
+                    set_reg!(inst.rd, format!("*({}*)(state->memory + addr)",
+                        loadtyp));
+                }
+                0b0100011 => {
+                    // We know it's an Stype
+                    let inst = Stype::from(inst);
+
+                    let (storetyp, access_size) =
+                            match inst.funct3 {
+                        0b000 => /* SB */ ("uint8_t",  1),
+                        0b001 => /* SH */ ("uint16_t", 2),
+                        0b010 => /* SW */ ("uint32_t", 4),
+                        0b011 => /* SD */ ("uint64_t", 8),
+                        _ => unreachable!(),
+                    };
+                    
+                    // Compute the write permission mask and the RAW permission
+                    // mask
+                    let mut perm_mask = 0u64;
+                    let mut raw_mask = 0u64;
+                    for ii in 0..access_size {
+                        perm_mask |= (PERM_WRITE as u64) << (ii * 8);
+                        raw_mask  |= (PERM_RAW as u64) << (ii * 8);
+                    }
+                    
+                    // Compute the address
+                    get_reg!("auto addr", inst.rs1);
+                    program += &format!("    addr += {:#x}ULL;\n",
+                        inst.imm as i64 as u64);
+                    
+                    // Check the bounds and permissions of the address
+                    program += &format!(r#"
+                    /*
+    if(addr > {}ULL - sizeof({}) ||
+            (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
+        state->exit_reason = WriteFault;
+        state->reenter_pc  = {:#x}ULL;
+        return;
+    }}
+
+    // Enable reads for memory with RAW set
+    auto perms = *({}*)(state->permissions + addr);
+    perms &= {:#x}ULL;
+    *({}*)(state->permissions + addr) |= perms >> 3;*/
+
+    auto block = addr / {};
+    auto idx   = block / 64;
+    auto bit   = 1 << (block % 64);
+    if((state->dirty_bitmap[idx] & bit) == 0) {{
+        state->dirty[state->dirty_idx++] = block;
+    }}
+    "#, self.memory.len(),
+        storetyp, storetyp, perm_mask, perm_mask, pc.0, storetyp, raw_mask,
+        storetyp, DIRTY_BLOCK_SIZE);
+
+                    // Write the memory!
+                    get_reg!(format!("*({}*)(state->memory + addr)",
+                        storetyp), inst.rs2);
+                }
+                0b0010011 => {
+                    // We know it's an Itype
+                    let inst = Itype::from(inst);
+                    
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDI
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd, format!("rs1 + {:#x}ULL",
+                                inst.imm as i64 as u64));
+                        }
+                        0b010 => {
+                            // SLTI
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd,
+                                format!("((int64_t)rs1 < {:#x}LL) ? 1 : 0",
+                                inst.imm as i64));
+                        }
+                        0b011 => {
+                            // SLTIU
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd,
+                                format!("((uint64_t)rs1 < {:#x}ULL) ? 1 : 0",
+                                inst.imm as i64 as u64));
+                        }
+                        0b100 => {
+                            // XORI
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd, format!("rs1 ^ {:#x}ULL",
+                                inst.imm as i64 as u64));
+                        }
+                        0b110 => {
+                            // ORI
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd, format!("rs1 | {:#x}ULL",
+                                inst.imm as i64 as u64));
+                        }
+                        0b111 => {
+                            // ANDI
+                            get_reg!("auto rs1", inst.rs1);
+                            set_reg!(inst.rd, format!("rs1 & {:#x}ULL",
+                                inst.imm as i64 as u64));
+                        }
+                        0b001 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+                            
+                            match mode {
+                                0b000000 => {
+                                    // SLLI
+                                    let shamt = inst.imm & 0b111111;
+                                    get_reg!("auto rs1", inst.rs1);
+                                    set_reg!(inst.rd, format!("rs1 << {}",
+                                        shamt));
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        0b101 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+                            
+                            match mode {
+                                0b000000 => {
+                                    // SRLI
+                                    let shamt = inst.imm & 0b111111;
+                                    get_reg!("auto rs1", inst.rs1);
+                                    set_reg!(inst.rd, format!("rs1 >> {}",
+                                        shamt));
+                                }
+                                0b010000 => {
+                                    // SRAI
+                                    let shamt = inst.imm & 0b111111;
+                                    get_reg!("auto rs1", inst.rs1);
+                                    set_reg!(inst.rd,
+                                             format!("(int64_t)rs1 >> {}",
+                                        shamt));
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b0110011 => {
+                    // We know it's an Rtype
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADD
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 + rs2");
+                        }
+                        (0b0100000, 0b000) => {
+                            // SUB
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 - rs2");
+                        }
+                        (0b0000000, 0b001) => {
+                            // SLL
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 << (rs2 & 0x3f)");
+                        }
+                        (0b0000000, 0b010) => {
+                            // SLT
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "((int64_t)rs1 < (int64_t)rs2) ? 1 : 0");
+                        }
+                        (0b0000000, 0b011) => {
+                            // SLTU
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "((uint64_t)rs1 < (uint64_t)rs2) ? 1 : 0");
+                        }
+                        (0b0000000, 0b100) => {
+                            // XOR
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 ^ rs2");
+                        }
+                        (0b0000000, 0b101) => {
+                            // SRL
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 >> (rs2 & 0x3f)");
+                        }
+                        (0b0100000, 0b101) => {
+                            // SRA
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                     "(int64_t)rs1 >> ((int64_t)rs2 & 0x3f)");
+                        }
+                        (0b0000000, 0b110) => {
+                            // OR
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 | rs2");
+                        }
+                        (0b0000000, 0b111) => {
+                            // AND
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 & rs2");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b0111011 => {
+                    // We know it's an Rtype
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADDW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs1 + rs2");
+                        }
+                        (0b0100000, 0b000) => {
+                            // SUBW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs1 - rs2");
+                        }
+                        (0b0000000, 0b001) => {
+                            // SLLW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs1 << (rs2 & 0x1f)");
+                        }
+                        (0b0000000, 0b101) => {
+                            // SRLW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs1 >> (rs2 & 0x1f)");
+                        }
+                        (0b0100000, 0b101) => {
+                            // SRAW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd,
+                                     "(int32_t)rs1 >> ((int32_t)rs2 & 0x1f)");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b0001111 => {
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // FENCE
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b1110011 => {
+                    if inst == 0b00000000000000000000000001110011 {
+                        // ECALL
+                        program += &format!(r#"
+    state->exit_reason = Ecall;
+    state->reenter_pc  = {:#x}ULL;
+    return;
+"#, pc.0);
+                    } else if inst == 0b00000000000100000000000001110011 {
+                        // EBREAK
+                        program += &format!(r#"
+    state->exit_reason = Ebreak;
+    state->reenter_pc  = {:#x}ULL;
+    return;
+"#, pc.0);
+                    } else {
+                        unreachable!();
+                    }
+                }
+                0b0011011 => {
+                    // We know it's an Itype
+                    let inst = Itype::from(inst);
+                    
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDIW
+                            get_regw!("auto rs1", inst.rs1);
+                            set_regw!(inst.rd, format!("rs1 + {}U",
+                                inst.imm as i32 as u32));
+                        }
+                        0b001 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+                            
+                            match mode {
+                                0b0000000 => {
+                                    // SLLIW
+                                    let shamt = inst.imm & 0b11111;
+                                    get_regw!("auto rs1", inst.rs1);
+                                    set_regw!(inst.rd,
+                                        format!("rs1 << {}",
+                                        shamt));
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        0b101 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+                            
+                            match mode {
+                                0b0000000 => {
+                                    // SRLIW
+                                    let shamt = inst.imm & 0b11111;
+                                    get_regw!("auto rs1", inst.rs1);
+                                    set_regw!(inst.rd,
+                                        format!("rs1 >> {}",
+                                        shamt));
+                                }
+                                0b0100000 => {
+                                    // SRAIW
+                                    let shamt = inst.imm & 0b11111;
+                                    get_regw!("auto rs1", inst.rs1);
+                                    set_regw!(inst.rd,
+                                        format!("(int32_t)rs1 >> {}",
+                                        shamt));
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unimplemented!("Unhandled opcode {:#09b}\n", opcode),
+            }
+
+            let next_inst = pc.0.wrapping_add(4);
+            program += "}\n";
+            program += &format!("    goto inst_{:016x};\n", next_inst);
+            queued.push_back(VirtAddr(next_inst));
+        }
+
+        // Close the function scope
+        program += "}\n";
+
+        let cppfn = std::env::temp_dir().join(
+            format!("fwetmp_{:?}.cpp",
+                    std::thread::current().id()));
+        let linkfn = std::env::temp_dir().join(
+            format!("fwetmp_{:?}.lunk",
+                    std::thread::current().id()));
+        let binfn = std::env::temp_dir().join(
+            format!("fwetmp_{:?}.bin",
+                    std::thread::current().id()));
+
+        // Write out the test program
+        std::fs::write(&cppfn, program)
+            .expect("Failed to write program");
+
+        // Create the ELF
+        let res = Command::new("clang++").args(&[
+            "-O3", "-march=native", "-Wall",
+            "-fno-asynchronous-unwind-tables",
+            "-Wno-unused-label",
+            "-Wno-unused-variable",
+            "-Werror",
+            //"-fno-strict-aliasing",
+            "-static", "-nostdlib", "-ffreestanding",
+            "-Wl,-Tldscript.ld", "-Wl,--gc-sections", "-Wl,--build-id=none",
+            "-o", linkfn.to_str().unwrap(),
+            cppfn.to_str().unwrap()]).status()
+            .expect("Failed to launch clang++");
+        assert!(res.success(), "clang++ returned error");
+
+        // Convert the ELF to a binary
+        let res = Command::new("objcopy")
+            .args(&["-O", "binary", "--remove-section=.note.gnu.property",
+                    linkfn.to_str().unwrap(),
+                    binfn.to_str().unwrap()]).status()
+            .expect("Failed to launch objcopy");
+        assert!(res.success(), "objcopy returned error");
+
+        Ok(std::fs::read(&binfn).expect("Failed to read JIT code"))
     }
 }
 
