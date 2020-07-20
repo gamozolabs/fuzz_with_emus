@@ -452,6 +452,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                 emu.fuzz_input.extend_from_slice(input);
             }
 
+            // The worlds best mutator
             if emu.fuzz_input.len() > 0 {
                 for _ in 0..rng.rand() % 128 {
                     let sel = rng.rand() % emu.fuzz_input.len();
