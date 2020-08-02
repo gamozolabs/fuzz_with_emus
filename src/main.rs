@@ -17,6 +17,13 @@ use aht::Aht;
 use falkhash::FalkHasher;
 use atomicvec::AtomicVec;
 
+/// If set, uses the enclosed string as a filename and uses it as the input
+/// without any corruption
+const REPRO_MODE: Option<&str> = None; //Some("crashes/0x11929c_Read_Normal.crash");
+
+/// If set, prints information about all hooked allocations
+const VERBOSE_ALLOCS: bool = false;
+
 /// If `true` the guest writes to stdout and stderr will be printed to our own
 /// stdout and stderr
 const VERBOSE_GUEST_PRINTS: bool = false;
@@ -454,10 +461,28 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
 
             // The worlds best mutator
             if emu.fuzz_input.len() > 0 {
-                for _ in 0..rng.rand() % 128 {
-                    let sel = rng.rand() % emu.fuzz_input.len();
-                    emu.fuzz_input[sel] = rng.rand() as u8;
+                match rng.rand() % 2 {
+                    0 => {
+                        for _ in 0..rng.rand() % (rng.rand() % 2048 + 1) {
+                            let sel = rng.rand() % emu.fuzz_input.len();
+                            emu.fuzz_input[sel] = rng.rand() as u8;
+                        }
+                    }
+                    1 => {
+                        for _ in 0..rng.rand() % 2048 {
+                            let sel = rng.rand() % emu.fuzz_input.len();
+                            emu.fuzz_input[sel] = rng.rand() as u8;
+                        }
+                    }
+                    _ => unreachable!(),
                 }
+            }
+
+            // If we're in repro mode, use the repro file
+            if let Some(repro_file) = REPRO_MODE {
+                emu.fuzz_input.clear();
+                emu.fuzz_input.extend_from_slice(&std::fs::read(repro_file)
+                    .expect("Failed to read repro file"));
             }
 
             let vmexit = loop {
@@ -554,12 +579,18 @@ pub struct Corpus {
 fn malloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     if let Some(alc) = emu.memory.allocate(emu.reg(Register::A1) as usize) {
         emu.set_reg(Register::A0, alc.0 as u64);
-    } else {
-        emu.set_reg(Register::A0, 0);
-    }
+        emu.set_reg(Register::Pc, emu.reg(Register::Ra));
+    
+        if VERBOSE_ALLOCS {
+            print!("malloc returned {:#018x} - size was {:#x}\n",
+                   alc.0, emu.reg(Register::A1));
+        }
 
-    emu.set_reg(Register::Pc, emu.reg(Register::Ra));
-    Ok(())
+        Ok(())
+    } else {
+        // Cannot satisfy allocation, return out
+        Err(VmExit::Exit)
+    }
 }
 
 fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
@@ -573,6 +604,16 @@ fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
         tmp.iter_mut().for_each(|x| *x = 0);
         Some(alc)
     }).unwrap_or(VirtAddr(0));
+
+    if result.0 == 0 {
+        // Cannot satisfy allocation, return out
+        return Err(VmExit::Exit);
+    }
+
+    if VERBOSE_ALLOCS {
+        print!("calloc returned {:#018x} - size was {:#x}\n", result.0,
+               size * nmemb);
+    }
 
     emu.set_reg(Register::A0, result.0 as u64);
     emu.set_reg(Register::Pc, emu.reg(Register::Ra));
@@ -597,6 +638,13 @@ fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 
     // Allocate the new memory
     let new_alc = emu.memory.allocate(size).and_then(|new_alc| {
+        if VERBOSE_ALLOCS {
+            print!("realloc {:#018x} -> {:#018x} - size {:#x} -> {:#x}\n",
+                   old_alc.0,
+                   new_alc.0,
+                   old_size, size);
+        }
+
         if old_alc != VirtAddr(0) {
             // Copy memory
             for ii in 0..to_copy {
@@ -616,6 +664,11 @@ fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 
         Some(new_alc)
     }).unwrap_or(VirtAddr(0));
+    
+    if new_alc.0 == 0 {
+        // Cannot satisfy allocation, return out
+        return Err(VmExit::Exit);
+    }
 
     emu.set_reg(Register::A0, new_alc.0 as u64);
     emu.set_reg(Register::Pc, emu.reg(Register::Ra));
@@ -625,6 +678,9 @@ fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     let base = VirtAddr(emu.reg(Register::A1) as usize);
     if base != VirtAddr(0) {
+        if VERBOSE_ALLOCS {
+            print!("free {:#018x}\n", base.0);
+        }
         emu.memory.free(base)?;
     }
     emu.set_reg(Register::Pc, emu.reg(Register::Ra));
@@ -633,6 +689,96 @@ fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 
 fn _end_case(_emu: &mut Emulator) -> Result<(), VmExit> {
     Err(VmExit::Exit)
+}
+
+pub fn load_elf<P: AsRef<Path>>(filename: P, emu: &mut Emulator)
+        -> io::Result<()> {
+    use std::process::Command;
+
+    // Invoke readelf to get the LOAD section offsets and information
+    let output = Command::new("readelf")
+        .arg("-W")
+        .arg("-l")
+        .arg(filename.as_ref().to_str().unwrap())
+        .output()?;
+    assert!(output.status.success(), "readelf returned error");
+    let stdout = core::str::from_utf8(&output.stdout)
+        .expect("Failed to get readelf stdout as a string");
+
+    let mut entry_point = None;
+    for line in stdout.lines() {
+        if line.starts_with("Entry point 0x") {
+            // Parse out the entry point
+            entry_point = Some(u64::from_str_radix(&line[14..], 16)
+                .expect("Entry point line malformed"));
+        } else {
+            let mut info = line.split_whitespace();
+
+            // Check if this is a line indicating a load section
+            if info.next() != Some("LOAD") {
+                continue;
+            }
+
+            // Parse out info from the readelf output
+            let offset = info.next().and_then(|x|
+                usize::from_str_radix(&x[2..], 16).ok())
+                .expect("Failed to parse offset");
+            let virt_addr = info.next().and_then(|x|
+                usize::from_str_radix(&x[2..], 16).ok())
+                .expect("Failed to parse virt addr");
+            let _phys_addr = info.next();
+            let file_size = info.next().and_then(|x|
+                usize::from_str_radix(&x[2..], 16).ok())
+                .expect("Failed to parse file size");
+            let mem_size = info.next().and_then(|x|
+                usize::from_str_radix(&x[2..], 16).ok())
+                .expect("Failed to parse memory size");
+            let _align = info.next_back();
+
+            let mut flags = info.fold(String::new(), |acc, x| acc + x + " ");
+            flags += "   ";
+
+            let read  = if &flags[0..1] == "R" { PERM_READ  } else { 0 };
+            let write = if &flags[1..2] == "W" { PERM_WRITE } else { 0 };
+            let exec  = if &flags[2..3] == "E" { PERM_EXEC  } else { 0 };
+
+            // Load into memory
+            emu.memory.load(&filename, &[
+                Section {
+                    file_off:    offset,
+                    virt_addr:   VirtAddr(virt_addr),
+                    file_size:   file_size,
+                    mem_size:    mem_size,
+                    permissions: Perm(read | write | exec),
+                },
+            ]).expect("Failed to load into emulator");
+        }
+    }
+    
+    // Invoke nm to get some symbol information
+    let output = Command::new("nm")
+        .arg(filename.as_ref().to_str().unwrap())
+        .output()?;
+    assert!(output.status.success(), "nm returned error");
+    let stdout = core::str::from_utf8(&output.stdout)
+        .expect("Failed to get nm stdout as a string");
+
+    // Parse NM output
+    for line in stdout.lines() {
+        let mut info = line.split_whitespace();
+        if info.clone().count() != 3 { continue; }
+
+        let addr  = usize::from_str_radix(info.next().unwrap(), 16).unwrap();
+        let _flag = info.next().unwrap();
+        let name  = info.next().unwrap();
+
+        // Register this symbol
+        emu.add_symbol(name, VirtAddr(addr));
+    }
+ 
+    // Set the program entry point
+    emu.set_reg(Register::Pc, entry_point.unwrap());
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
@@ -667,56 +813,16 @@ fn main() -> io::Result<()> {
     let jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
 
     // Create an emulator using the JIT
-    let mut emu = Emulator::new(32 * 1024 * 1024).enable_jit(jit_cache);
+    let mut emu = Emulator::new(1024 * 1024 * 1024).enable_jit(jit_cache);
 
-    // Load the application into the emulator
-    if true {
-        emu.memory.load("./objdump_riscv", &[
-            Section {
-                file_off:    0x0000000000000000,
-                virt_addr:   VirtAddr(0x0000000000010000),
-                file_size:   0x000000000020a1b8,
-                mem_size:    0x000000000020a1b8,
-                permissions: Perm(PERM_READ | PERM_EXEC),
-            },
-            Section {
-                file_off:    0x000000000020a1b8,
-                virt_addr:   VirtAddr(0x21b1b8),
-                file_size:   0x0000000000008332,
-                mem_size:    0x000000000000fd98,
-                permissions: Perm(PERM_READ | PERM_WRITE),
-            },
-        ]).expect("Failed to load test application into address space");
-
-        emu.add_breakpoint(VirtAddr(0x1151d0), malloc_bp);
-        emu.add_breakpoint(VirtAddr(0x1120e8), calloc_bp);
-        emu.add_breakpoint(VirtAddr(0x113610), free_bp);
-        emu.add_breakpoint(VirtAddr(0x117930), realloc_bp);
-        //emu.add_breakpoint(VirtAddr(0x1c1f0), _end_case);
-        
-        // Set the program entry point
-        emu.set_reg(Register::Pc, 0x109a4);
-    } else {
-        emu.memory.load("./objdump_old", &[
-            Section {
-                file_off:    0x0000000000000000,
-                virt_addr:   VirtAddr(0x0000000000010000),
-                file_size:   0x00000000000e1994,
-                mem_size:    0x00000000000e1994,
-                permissions: Perm(PERM_READ | PERM_EXEC),
-            },
-            Section {
-                file_off:    0x00000000000e2000,
-                virt_addr:   VirtAddr(0x00000000000f2000),
-                file_size:   0x0000000000001e32,
-                mem_size:    0x00000000000046c8,
-                permissions: Perm(PERM_READ | PERM_WRITE),
-            },
-        ]).expect("Failed to load test application into address space");
+    // Load the ELF into the memory
+    load_elf("./objdump_riscv", &mut emu)?;
     
-        // Set the program entry point
-        emu.set_reg(Register::Pc, 0x104e8);
-    }
+    // Register breakpoints
+    emu.add_breakpoint(emu.resolve_symbol("_malloc_r").unwrap(), malloc_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_calloc_r").unwrap(), calloc_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_realloc_r").unwrap(), realloc_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_free_r").unwrap(), free_bp);
 
     // Set up a stack
     let stack = emu.memory.allocate(32 * 1024)
@@ -839,7 +945,14 @@ fn main() -> io::Result<()> {
         });
     }
 
-    for _ in 0..192 {
+    // Limit cores during repro mode
+    let num_cores = if REPRO_MODE.is_some() {
+        1
+    } else {
+        192
+    };
+
+    for _ in 0..num_cores {
         let new_emu = emu.fork();
         let stats   = stats.clone();
         let parent  = emu.clone();

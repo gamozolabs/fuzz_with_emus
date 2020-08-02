@@ -74,7 +74,7 @@ impl Default for GuestState {
             trace_len:     0,
             cov_bitmap:    0,
             instrs_execed: 0,
-            timeout:       50_000_000,
+            timeout:       1_500_000_000,
         }
     }
 }
@@ -254,6 +254,12 @@ pub struct Emulator {
 
     /// File handle table (indexed by file descriptor)
     pub files: Files,
+
+    /// Mapping of symbol names to virtual addresses
+    symbols: BTreeMap<String, VirtAddr>,
+
+    /// Mapping of virtual addresses to their symbols
+    vaddr_to_symbol: BTreeMap<VirtAddr, String>,
 
     /// Breakpoint callbacks
     breakpoints: BTreeMap<VirtAddr, BreakpointCallback>,
@@ -482,8 +488,45 @@ impl Emulator {
             ]),
             jit_cache: None,
             breakpoints: BTreeMap::new(),
+            symbols: BTreeMap::new(),
+            vaddr_to_symbol: BTreeMap::new(),
             trace: Vec::with_capacity(
                 if ENABLE_TRACING { 10_000_000 } else { 0 }),
+        }
+    }
+
+    /// Add a symbol to the symbol database
+    pub fn add_symbol<S: AsRef<str>>(&mut self, name: S, vaddr: VirtAddr) {
+        self.symbols.insert(name.as_ref().to_string(), vaddr);
+        self.vaddr_to_symbol.insert(vaddr, name.as_ref().to_string());
+    }
+
+    /// Resolve a symbol name into a virtual address
+    pub fn resolve_symbol<S: AsRef<str>>(&self, symbol: S)
+            -> Option<VirtAddr> {
+        self.symbols.get(symbol.as_ref()).copied()
+    }
+
+    /// Resolve a virtual address into a symbol + offset string, omitting the
+    /// symbol if no symbol could be resolved
+    pub fn get_symbol(&self, vaddr: VirtAddr) -> String {
+        match self.get_symbol_offset(vaddr) {
+            (Some(symbol), offset) => {
+                format!("{}+{:#x}", symbol, offset)
+            }
+            (None, offset) => {
+                format!("{:#x}", offset)
+            }
+        }
+    }
+
+    /// Resolve a virtual address into a symbol + offset
+    pub fn get_symbol_offset(&self, vaddr: VirtAddr) -> (Option<&str>, usize) {
+        if let Some((base, name)) = self.vaddr_to_symbol.range(..=vaddr)
+                .next_back() {
+            (Some(name), vaddr.0 - base.0)
+        } else {
+            (None, vaddr.0)
         }
     }
 
@@ -493,12 +536,14 @@ impl Emulator {
         state.regs = self.state.regs;
 
         Emulator {
-            memory:      self.memory.fork(),
-            state:       state,
-            fuzz_input:  self.fuzz_input.clone(),
-            files:       self.files.clone(),
-            jit_cache:   self.jit_cache.clone(),
-            breakpoints: self.breakpoints.clone(),
+            memory:          self.memory.fork(),
+            state:           state,
+            fuzz_input:      self.fuzz_input.clone(),
+            files:           self.files.clone(),
+            jit_cache:       self.jit_cache.clone(),
+            breakpoints:     self.breakpoints.clone(),
+            symbols:         self.symbols.clone(),
+            vaddr_to_symbol: self.vaddr_to_symbol.clone(),
             trace: Vec::with_capacity(
                 if ENABLE_TRACING { 10_000_000 } else { 0 }),
         }
@@ -525,7 +570,10 @@ impl Emulator {
             for trace in &self.trace {
                 self.state.regs = *trace;
                 tracestr += &format!("{}\n", self);
-                pctracestr += &format!("{:x}\n", self.reg(Register::Pc));
+                pctracestr += &format!("{:016x} {}\n",
+                    self.reg(Register::Pc),
+                    self.get_symbol(VirtAddr(self.reg(Register::Pc) as usize))
+                );
             }
             if self.trace.len() > 0 {
                 std::fs::write("trace.txt", tracestr).unwrap();

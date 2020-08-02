@@ -139,11 +139,6 @@ impl Mmu {
 
         // Get the current allocation base
         let base = self.cur_alc;
-        
-        // Return current base on 0 size allocations
-        if size == 0 {
-            return Some(base);
-        }
 
         // Cannot allocate
         if base.0 >= self.memory.len() {
@@ -188,6 +183,9 @@ impl Mmu {
     /// Apply permissions to a region of memory
     pub fn set_permissions(&mut self, addr: VirtAddr, size: usize,
                            mut perm: Perm) -> Option<()> {
+        // Fast path, nothing to change
+        if size == 0 { return Some(()); }
+
         if DISABLE_UNINIT {
             // If memory is marked as RAW, mark it as readable right away if
             // we have uninit tracking disabled
