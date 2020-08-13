@@ -1627,7 +1627,7 @@ impl Emulator {
                     coverage_event!("CmpCoverage",
                         format!(
                             "{:#x}ULL ^ (state->call_stack_hash & 0xff) ^ \
-                             (state->path_hash & 0xff)", pc.0), "res", true);
+                             (state->path_hash & 0xff)", pc.0), "res");
                 }
             }
         }
@@ -1666,12 +1666,10 @@ impl Emulator {
             // if the coverage is new. Thus, it is critical that no side
             // effects occur prior to the coverage_event!() macro use.
             macro_rules! coverage_event {
-                ($cov_source:expr, $from:expr, $to:expr, $indirect:expr) => {
+                ($cov_source:expr, $from:expr, $to:expr) => {
                     if CODE_COVERAGE {
                         program += &format!(
 r#"{{
-    static int moose = 0;
-
     /*
     // Check for timeout
     if(state->instrs_execed > state->timeout) {{
@@ -1680,11 +1678,13 @@ r#"{{
         return;
     }}*/
 
-    if({indirect} || !moose) {{
-        moose = 1;
+    /*
+    static int reported = 0;
+    if(!reported) {{
+        reported = 1;
         report_coverage(state, {from}, {to}, {pc});
-    }}
-}}"#, from = $from, to = $to, pc = pc.0, indirect=$indirect);
+    }}*/
+}}"#, from = $from, to = $to, pc = pc.0);
                     }
                 }
             }
@@ -1764,7 +1764,7 @@ r#"{{
                     // Record coverage
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target), false);
+                        format!("{:#x}ULL", target));
 
                     if USE_CALL_STACK && inst.rd == Register::Ra {
                         program += &format!(r#"
@@ -1826,7 +1826,7 @@ r#"{{
                             // Record coverage
                             coverage_event!("Coverage",
                                 format!("{:#x}ULL", pc.0),
-                                "target", true);
+                                "target");
 
                             // Set the return address
                             set_reg!(inst.rd, retaddr);
@@ -1867,7 +1867,7 @@ r#"{{
                     // Record coverage for true condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target), false);
+                        format!("{:#x}ULL", target));
 
                     program +=
                         &format!("        return inst_{:016x}(state);\n",
@@ -1877,7 +1877,7 @@ r#"{{
                     // Record coverage for false condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", pc.0.wrapping_add(4)), false);
+                        format!("{:#x}ULL", pc.0.wrapping_add(4)));
 
                     // Queue exploration of this target
                     queued.push_back(VirtAddr(target));

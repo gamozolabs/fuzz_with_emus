@@ -2,6 +2,7 @@ pub mod primitive;
 pub mod mmu;
 pub mod emulator;
 pub mod jitcache;
+pub mod affinity;
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -438,8 +439,12 @@ struct Statistics {
     vmexits: BTreeMap<VmExit, u64>,
 }
 
-fn worker(mut emu: Emulator, original: Arc<Emulator>,
+fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
           stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
+    // Pin to a core
+    print!("{}\n", thr_id);
+    affinity::set_affinity(thr_id).unwrap();
+
     // Create a new random number generator
     let mut rng = Rng::new();
         
@@ -922,7 +927,7 @@ fn main() -> io::Result<()> {
     let _jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
 
     // Create an emulator using the JIT
-    let emu = Emulator::new(128 * 1024 * 1024);
+    let emu = Emulator::new(8 * 1024 * 1024);
     let mut emu = if REPRO_MODE.is_some() {
         emu
     } else {
@@ -1080,16 +1085,16 @@ fn main() -> io::Result<()> {
     let num_cores = if REPRO_MODE.is_some() {
         1
     } else {
-        1
+        192
     };
 
-    for _ in 0..num_cores {
+    for thr_id in 0..num_cores {
         let new_emu = emu.fork();
         let stats   = stats.clone();
         let parent  = emu.clone();
         let corpus  = corpus.clone();
         std::thread::spawn(move || {
-            worker(new_emu, parent, stats, corpus);
+            worker(thr_id, new_emu, parent, stats, corpus);
         });
     }
 
