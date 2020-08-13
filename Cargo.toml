@@ -10,3 +10,4 @@ edition = "2018"
 falkhash = { path = "shared/falkhash" }
 aht = { path = "shared/aht" }
 atomicvec = { path = "shared/atomicvec" }
+basic_mutator = { path = "../mutator" }

@@ -9,6 +9,10 @@ name = "atomicvec"
 version = "0.1.0"
 
 [[package]]
+name = "basic_mutator"
+version = "0.1.0"
+
+[[package]]
 name = "falkhash"
 version = "0.1.0"
 
@@ -18,5 +22,6 @@ version = "0.1.0"
 dependencies = [
  "aht",
  "atomicvec",
+ "basic_mutator",
  "falkhash",
 ]

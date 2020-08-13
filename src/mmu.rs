@@ -2,7 +2,7 @@
 //! detection
 
 use std::path::Path;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use crate::emulator::VmExit;
 use crate::primitive::Primitive;
 
@@ -23,6 +23,9 @@ pub const PERM_WRITE: u8 = 1 << 1;
 pub const PERM_EXEC:  u8 = 1 << 2;
 pub const PERM_RAW:   u8 = 1 << 3;
 
+/// Accessed bit, set when the byte is read, but not when it is written
+pub const PERM_ACC: u8 = 1 << 4;
+
 /// A permissions byte which corresponds to a memory byte and defines the
 /// permissions it has
 #[repr(transparent)]
@@ -31,7 +34,7 @@ pub struct Perm(pub u8);
 
 /// A guest virtual address
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtAddr(pub usize);
 
 /// Section information for a file
@@ -43,8 +46,8 @@ pub struct Section {
     pub permissions: Perm,
 }
 
-#[derive(PartialEq)]
 /// An isolated memory space
+#[derive(PartialEq)]
 pub struct Mmu {
     /// Block of memory for this address space
     /// Offset 0 corresponds to address 0 in the guest address space
@@ -53,29 +56,59 @@ pub struct Mmu {
     /// Holds the permission bytes for the corresponding byte in memory
     permissions: Vec<Perm>,
 
-    /// Tracks block indicies in `memory` which are dirty
-    dirty: Vec<usize>,
-
-    /// Tracks which parts of memory have been dirtied
-    dirty_bitmap: Vec<u64>,
+    /// Dirtied memory information
+    dirty_state: DirtyState,
 
     /// Current base address of the next allocation
     cur_alc: VirtAddr,
 
     /// Map an active allocation to its size
-    active_alcs: BTreeMap<VirtAddr, usize>,
+    active_alcs: HashMap<VirtAddr, usize>,
+}
+
+/// Tracks the state of dirtied memory
+#[derive(PartialEq)]
+pub struct DirtyState {
+    /// Tracks block indicies in `memory` which are dirty
+    dirty: Vec<usize>,
+
+    /// Tracks which parts of memory have been dirtied
+    dirty_bitmap: Vec<u64>,
+}
+
+impl DirtyState {
+    /// Updates the dirty map indicating that the byte at `addr` has been
+    /// dirtied
+    fn update_dirty(&mut self, addr: VirtAddr) {
+        let block = addr.0 / DIRTY_BLOCK_SIZE;
+
+        // Determine the bitmap position of the dirty block
+        let idx = block / 64;
+        let bit = block % 64;
+        
+        // Check if the block is not dirty
+        if self.dirty_bitmap[idx] & (1 << bit) == 0 {
+            // Block is not dirty, add it to the dirty list
+            self.dirty.push(block);
+
+            // Update the dirty bitmap
+            self.dirty_bitmap[idx] |= 1 << bit;
+        }
+    }
 }
 
 impl Mmu {
     /// Create a new memory space which can hold `size` bytes
     pub fn new(size: usize) -> Self {
         Mmu {
-            memory:       vec![0; size],
-            permissions:  vec![Perm(0); size],
-            dirty:        Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
-            dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
-            cur_alc:      VirtAddr(0x10000),
-            active_alcs:  BTreeMap::new(),
+            memory:      vec![0; size],
+            permissions: vec![Perm(0); size],
+            cur_alc:     VirtAddr(0x10000),
+            active_alcs: Default::default(),
+            dirty_state: DirtyState {
+                dirty:        Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
+                dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
+            },
         }
     }
 
@@ -84,26 +117,28 @@ impl Mmu {
         let size = self.memory.len();
 
         Mmu {
-            memory:       self.memory.clone(),
-            permissions:  self.permissions.clone(),
-            dirty:        Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
-            dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
-            cur_alc:      self.cur_alc.clone(),
-            active_alcs:  self.active_alcs.clone(),
+            memory:      self.memory.clone(),
+            permissions: self.permissions.clone(),
+            cur_alc:     self.cur_alc.clone(),
+            active_alcs: self.active_alcs.clone(),
+            dirty_state: DirtyState {
+                dirty:        Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
+                dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
+            }
         }
     }
 
     /// Restores memory back to the original state (eg. restores all dirty
     /// blocks to the state of `other`)
     pub fn reset(&mut self, other: &Mmu) {
-        for &block in &self.dirty {
+        for &block in &self.dirty_state.dirty {
             // Get the start and end addresses of the dirtied memory
             let start = block * DIRTY_BLOCK_SIZE;
             let end   = (block + 1) * DIRTY_BLOCK_SIZE;
 
             // Zero the bitmap. This hits wide, but it's fine, we have to do
             // a 64-bit write anyways, no reason to compute the bit index
-            self.dirty_bitmap[block / 64] = 0;
+            self.dirty_state.dirty_bitmap[block / 64] = 0;
 
             // Restore memory state
             self.memory[start..end].copy_from_slice(&other.memory[start..end]);
@@ -114,7 +149,7 @@ impl Mmu {
         }
 
         // Clear the dirty list
-        self.dirty.clear();
+        self.dirty_state.dirty.clear();
 
         // Restore allocator state
         self.cur_alc = other.cur_alc;
@@ -205,12 +240,12 @@ impl Mmu {
             let bit = block % 64;
             
             // Check if the block is not dirty
-            if self.dirty_bitmap[idx] & (1 << bit) == 0 {
+            if self.dirty_state.dirty_bitmap[idx] & (1 << bit) == 0 {
                 // Block is not dirty, add it to the dirty list
-                self.dirty.push(block);
+                self.dirty_state.dirty.push(block);
 
                 // Update the dirty bitmap
-                self.dirty_bitmap[idx] |= 1 << bit;
+                self.dirty_state.dirty_bitmap[idx] |= 1 << bit;
             }
         }
 
@@ -226,13 +261,13 @@ impl Mmu {
     /// Get the dirty list length
     #[inline]
     pub fn dirty_len(&self) -> usize {
-        self.dirty.len()
+        self.dirty_state.dirty.len()
     }
 
     /// Set the dirty list length
     #[inline]
     pub unsafe fn set_dirty_len(&mut self, len: usize) {
-        self.dirty.set_len(len);
+        self.dirty_state.dirty.set_len(len);
     }
 
     /// Get the tuple of (memory ptr, permissions pointer, dirty pointer,
@@ -242,8 +277,8 @@ impl Mmu {
         (
             self.memory.as_ptr() as usize,
             self.permissions.as_ptr() as usize,
-            self.dirty.as_ptr() as usize,
-            self.dirty_bitmap.as_ptr() as usize,
+            self.dirty_state.dirty.as_ptr() as usize,
+            self.dirty_state.dirty_bitmap.as_ptr() as usize,
         )
     }
 
@@ -280,12 +315,12 @@ impl Mmu {
             let bit = block % 64;
             
             // Check if the block is not dirty
-            if self.dirty_bitmap[idx] & (1 << bit) == 0 {
+            if self.dirty_state.dirty_bitmap[idx] & (1 << bit) == 0 {
                 // Block is not dirty, add it to the dirty list
-                self.dirty.push(block);
+                self.dirty_state.dirty.push(block);
 
                 // Update the dirty bitmap
-                self.dirty_bitmap[idx] |= 1 << bit;
+                self.dirty_state.dirty_bitmap[idx] |= 1 << bit;
             }
         }
 
@@ -302,6 +337,14 @@ impl Mmu {
         Ok(())
     }
     
+    /// Return a mutable slice to permissions at `addr` for `size` bytes
+    pub fn peek_perms(&mut self, addr: VirtAddr, size: usize)
+            -> Result<&mut [Perm], VmExit> {
+        self.permissions.get_mut(addr.0..addr.0.checked_add(size)
+            .ok_or(VmExit::AddressIntegerOverflow)?)
+            .ok_or(VmExit::AddressMiss(addr, size))
+    }
+ 
     /// Return a mutable slice to memory at `addr` for `size` bytes that
     /// has been validated to match all `exp_perms`
     pub fn peek(&mut self, addr: VirtAddr, size: usize,
@@ -312,8 +355,7 @@ impl Mmu {
             .ok_or(VmExit::AddressMiss(addr, size))?;
 
         // Check permissions
-        let mut has_raw = false;
-        for (idx, perm) in perms.iter_mut().enumerate() {
+        for (idx, perm) in perms.iter().enumerate() {
             if (perm.0 & exp_perms.0) != exp_perms.0 {
                 if exp_perms.0 == PERM_READ && (perm.0 & PERM_RAW) != 0 {
                     // If we were attempting a normal read, and the readable
@@ -327,24 +369,28 @@ impl Mmu {
                     return Err(VmExit::ReadFault(VirtAddr(addr.0 + idx)));
                 }
             }
-
-            if (exp_perms.0 & PERM_WRITE) != 0 && (perm.0 & PERM_RAW) != 0 {
-                has_raw = true;
-            }
         }
 
-        if has_raw {
-            for perm in perms.iter_mut() {
-                // Check if we're getting write access
-                if (exp_perms.0 & PERM_WRITE) != 0 {
-                    // Propagate RAW
-                    if (perm.0 & PERM_RAW) != 0 {
-                        perm.0 |= PERM_READ;
-                    }
+        // Update dirty bits
+        for (ii, perm) in perms.iter_mut().enumerate() {
+            // Check if we're getting write access
+            if (exp_perms.0 & PERM_WRITE) != 0 {
+                // Propagate RAW
+                if (perm.0 & PERM_RAW) != 0 {
+                    perm.0 |= PERM_READ;
                 }
+
+                // Update dirty bits
+                self.dirty_state.update_dirty(VirtAddr(addr.0 + ii));
+            }
+
+            // Indicate the memory has been accessed
+            if (exp_perms.0 & PERM_READ) != 0 {
+                perm.0 |= PERM_ACC;
+                self.dirty_state.update_dirty(VirtAddr(addr.0 + ii));
             }
         }
-
+       
         // Return a slice to the memory
         Ok(&mut self.memory[addr.0..addr.0 + size])
     }
@@ -352,10 +398,10 @@ impl Mmu {
     /// Read the memory at `addr` into `buf`
     /// This function checks to see if all bits in `exp_perms` are set in the
     /// permission bytes. If this is zero, we ignore permissions entirely.
-    pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8],
+    pub fn read_into_perms(&mut self, addr: VirtAddr, buf: &mut [u8],
                            exp_perms: Perm) -> Result<(), VmExit> {
         let perms =
-            self.permissions.get(addr.0..addr.0.checked_add(buf.len())
+            self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())
                 .ok_or(VmExit::AddressIntegerOverflow)?)
             .ok_or(VmExit::AddressMiss(addr, buf.len()))?;
 
@@ -376,18 +422,24 @@ impl Mmu {
 
         // Copy the memory
         buf.copy_from_slice(&self.memory[addr.0..addr.0 + buf.len()]);
+        
+        // Indicate that this memory has been accessed
+        for (ii, perm) in perms.iter_mut().enumerate() {
+            perm.0 |= PERM_ACC;
+            self.dirty_state.update_dirty(VirtAddr(addr.0 + ii));
+        }
 
         Ok(())
     }
 
     /// Read the memory at `addr` into `buf`
-    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8])
+    pub fn read_into(&mut self, addr: VirtAddr, buf: &mut [u8])
             -> Result<(), VmExit> {
         self.read_into_perms(addr, buf, Perm(PERM_READ))
     }
 
     /// Read a type `T` at `vaddr` expecting `perms`
-    pub fn read_perms<T: Primitive>(&self, addr: VirtAddr,
+    pub fn read_perms<T: Primitive>(&mut self, addr: VirtAddr,
                                     exp_perms: Perm) -> Result<T, VmExit> {
         let mut tmp = [0u8; 16];
         self.read_into_perms(addr, &mut tmp[..core::mem::size_of::<T>()],
@@ -396,7 +448,7 @@ impl Mmu {
     }
     
     /// Read a type `T` at `vaddr`
-    pub fn read<T: Primitive>(&self, addr: VirtAddr) -> Result<T, VmExit> {
+    pub fn read<T: Primitive>(&mut self, addr: VirtAddr) -> Result<T, VmExit> {
         self.read_perms(addr, Perm(PERM_READ))
     }
     

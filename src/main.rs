@@ -7,19 +7,22 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
-use std::collections::BTreeSet;
-use mmu::{VirtAddr, Perm, Section, PERM_READ, PERM_WRITE, PERM_EXEC};
+use std::collections::{BTreeMap, BTreeSet};
+use mmu::{VirtAddr, Perm, Section, PERM_READ, PERM_WRITE, PERM_EXEC, PERM_ACC};
 use emulator::{Emulator, Register, VmExit, EmuFile, FaultType, AddressType};
+use emulator::{CoverageType, COVERAGE_ENTRY_EMPTY};
 use jitcache::JitCache;
 
 use aht::Aht;
 use falkhash::FalkHasher;
 use atomicvec::AtomicVec;
+use basic_mutator::{Mutator, InputDatabase, EmptyDatabase};
 
 /// If set, uses the enclosed string as a filename and uses it as the input
 /// without any corruption
-const REPRO_MODE: Option<&str> = None; //Some("crashes/0x11929c_Read_Normal.crash");
+const REPRO_MODE: Option<&str> = None; //Some("crashes/0x3d670_Read_Normal.crash");
 
 /// If set, prints information about all hooked allocations
 const VERBOSE_ALLOCS: bool = false;
@@ -37,7 +40,8 @@ struct Rng(u64);
 impl Rng {
     /// Create a new random number generator
     fn new() -> Self {
-        Rng(0x8644d6eb17b7ab1a ^ rdtsc())
+        //Rng(0x8644d6eb17b7ab1a ^ rdtsc())
+        Rng(0x8644d6eb17b7ab1a)
     }
 
     /// Generate a random number
@@ -257,6 +261,8 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
             let bytes = emu.memory.peek(VirtAddr(filename),
                 fnlen, Perm(PERM_READ))?;
 
+            print!("Open {:x?}\n", bytes);
+
             if bytes == b"testfn" {
                 // Create a new file descriptor
                 let fd = emu.alloc_file();
@@ -427,12 +433,23 @@ struct Statistics {
     
     /// Total number of CPU cycles spent emulating
     vm_cycles: u64,
+
+    /// Frequencies of vmexits
+    vmexits: BTreeMap<VmExit, u64>,
 }
 
 fn worker(mut emu: Emulator, original: Arc<Emulator>,
           stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
     // Create a new random number generator
     let mut rng = Rng::new();
+        
+    // Get the buffer and the length for the input
+    let buf = emu.reg(Register::A0);
+    let len = emu.reg(Register::A1) as usize;
+
+    // Create a mutator
+    let mut mutator = Mutator::new().seed(rng.rand() as u64)
+        .max_input_size(16 * 1024);
 
     loop {
         // Start a timer
@@ -444,7 +461,11 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
         while (rdtsc() - it) < 500_000_000 {
             // Reset emu to original state
             let it = rdtsc();
-            emu.reset(&*original);
+            emu.reset(&*original, &corpus, |emu| {
+                let perms = emu.memory.peek_perms(VirtAddr(buf as usize),
+                    len).unwrap();
+                perms.iter().map(|perm| (perm.0 & PERM_ACC) != 0).collect()
+            });
             local_stats.reset_cycles += rdtsc() - it;
 
             // Number of instructions executed this fuzz case
@@ -452,38 +473,54 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
 
             // Clear the fuzz input
             emu.fuzz_input.clear();
+            mutator.input.clear();
+            mutator.accessed.clear();
 
             // Pick a random file from the corpus as an input
-            let sel = rng.rand() % corpus.inputs.len();
-            if let Some(input) = corpus.inputs.get(sel) {
-                emu.fuzz_input.extend_from_slice(input);
-            }
+            if (rng.rand() % 32) != 0 && corpus.inputs.len() > 0 {
+                // Build upon a previous input from the coverage guided inputs
+                let sel = rng.rand() % corpus.inputs.len();
+                if let Some(input) = corpus.inputs.get(sel) {
+                    // Copy the input
+                    mutator.input.extend_from_slice(&input.data);
 
-            // The worlds best mutator
-            if emu.fuzz_input.len() > 0 {
-                match rng.rand() % 2 {
-                    0 => {
-                        for _ in 0..rng.rand() % (rng.rand() % 2048 + 1) {
-                            let sel = rng.rand() % emu.fuzz_input.len();
-                            emu.fuzz_input[sel] = rng.rand() as u8;
-                        }
-                    }
-                    1 => {
-                        for _ in 0..rng.rand() % 2048 {
-                            let sel = rng.rand() % emu.fuzz_input.len();
-                            emu.fuzz_input[sel] = rng.rand() as u8;
-                        }
-                    }
-                    _ => unreachable!(),
+                    // Set a timeout which can reach all coverage for this
+                    // input
+                    emu.set_timeout(input.instrs + 1_000_000);
+
+                    // Update accessed information
+                    //mutator.accessed.extend_from_slice(&input.accessed);
+                }
+            }
+           
+            if mutator.input.len() == 0 && corpus.corpus.len() > 0 {
+                // Build upon an input from the corpus
+                let sel = rng.rand() % corpus.corpus.len();
+                if let Some(input) = corpus.corpus.get(sel) {
+                    mutator.input.extend_from_slice(&input);
                 }
             }
 
+            if mutator.input.len() == 0 {
+                // Just make a blank input
+                mutator.input.resize(128 * 1024, 0u8);
+            }
+
+            // Mutate!
+            //mutator.mutate(rng.rand() % 16, &*corpus);
+            
             // If we're in repro mode, use the repro file
             if let Some(repro_file) = REPRO_MODE {
-                emu.fuzz_input.clear();
-                emu.fuzz_input.extend_from_slice(&std::fs::read(repro_file)
+                mutator.input.clear();
+                mutator.input.extend_from_slice(&std::fs::read(repro_file)
                     .expect("Failed to read repro file"));
             }
+
+            emu.fuzz_input.extend_from_slice(&mutator.input);
+            assert!(emu.fuzz_input.len() <= len);
+            emu.memory.write_from(VirtAddr(buf as usize), &emu.fuzz_input)
+                .unwrap();
+            emu.set_reg(Register::A1, emu.fuzz_input.len() as u64);
 
             let vmexit = loop {
                 let vmexit = emu.run(&mut run_instrs,
@@ -504,7 +541,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                     _ => break vmexit,
                 }
             };
-
+            
             if let Some((fault_type, vaddr)) = vmexit.is_crash() {
                 // Update crash stats
                 local_stats.crashes += 1;
@@ -517,19 +554,31 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                     let hash = corpus.hasher.hash(&emu.fuzz_input);
                     corpus.input_hashes.entry_or_insert(
                             &hash, hash as usize, || {
-                        corpus.inputs.push(Box::new(emu.fuzz_input.clone()));
+                        let perms = emu.memory.peek_perms(VirtAddr(buf as usize),
+                            len).unwrap();
+                        let accessed: Vec<bool> = 
+                            perms.iter().map(|perm| (perm.0 & PERM_ACC) != 0)
+                            .collect();
+                        corpus.inputs.push(
+                            Box::new(Input::new(emu.timeout(),
+                                emu.fuzz_input.clone(), accessed)));
                         Box::new(())
                     });
 
                     // Save the crashing file
-                    std::fs::write(Path::new("crashes").join(
+                    let crash_fn = Path::new("crashes").join(
                         format!("{:#x}_{:?}_{:?}.crash",
-                                (key.0).0, key.1, key.2)),
+                                (key.0).0, key.1, key.2));
+                    print!("New crash {:?}\n", crash_fn);
+                    std::fs::write(&crash_fn,
                         &emu.fuzz_input).expect("Failed to write fuzz input");
 
                     Box::new(())
                 });
             }
+
+            // Update vmexit frequencies
+            *local_stats.vmexits.entry(vmexit).or_insert(0) += 1;
 
             local_stats.instrs_execed += run_instrs;
             local_stats.fuzz_cases    += 1;
@@ -544,9 +593,53 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
         stats.reset_cycles  += local_stats.reset_cycles;
         stats.vm_cycles     += local_stats.vm_cycles;
 
+        for (vme, freq) in local_stats.vmexits.iter() {
+            *stats.vmexits.entry(*vme).or_insert(0) += freq;
+        }
+        local_stats.vmexits.clear();
+
         // Compute amount of time during the batch
         let batch_elapsed = rdtsc() - batch_start;
         stats.total_cycles += batch_elapsed;
+    }
+}
+
+pub struct Input {
+    /// The instruction count of the most recently generated coverage from this
+    /// input. This allows us to know how "deep" we need to fuzz this input
+    instrs: u64,
+
+    /// The raw input
+    data: Vec<u8>,
+
+    /// A sorted vector of indicies from `data` which are used during the fuzz
+    /// case
+    accessed: Vec<usize>,
+}
+
+impl Input {
+    /// Creates a new input from an instruction count, a raw input, and the
+    /// accessed mapping associating `data` bytes to accessed ones
+    pub fn new(instrs: u64, data: Vec<u8>, accessed: Vec<bool>) -> Input {
+        // Sorted vector of accessed indicies in `data`
+        let mut avec = Vec::new();
+
+        // Create the vector of indicies
+        let num_acc = std::cmp::min(data.len(), accessed.len());
+        for (ii, &is_acc) in accessed[..num_acc].iter().enumerate() {
+            if is_acc {
+                avec.push(ii);
+            }
+        }
+
+        print!("New input {} bytes, {} accessed [{:.4}]\n",
+            data.len(), avec.len(), avec.len() as f64 / data.len() as f64);
+
+        Input {
+            instrs,
+            data,
+            accessed: avec
+        }
     }
 }
 
@@ -556,7 +649,10 @@ pub struct Corpus {
     pub input_hashes: Aht<u128, (), 1048576>,
     
     /// Linear list of all inputs
-    pub inputs: AtomicVec<Vec<u8>, 1048576>,
+    pub inputs: AtomicVec<Input, 1048576>,
+    
+    /// Linear list of all corpus inputs
+    pub corpus: AtomicVec<Vec<u8>, 1048576>,
     
     /// Unique crashes
     /// Tuple is (PC, FaultType, AddressType)
@@ -565,15 +661,30 @@ pub struct Corpus {
     /// Code coverage, (to, from) edges for _all_ branches, including
     /// taken, not taken, indirect, and unconditional
     pub code_coverage: Aht<(VirtAddr, VirtAddr), (), 1048576>,
+    
+    /// Coverage for all types of coverage, (typ, info0, info1, info2) 
+    pub coverage: Aht<(CoverageType, u64, u64, u64), (), 134217728>,
 
     /// Hasher
     pub hasher: FalkHasher,
 
-    /// Coverage bitmap
-    pub coverage_bitmap: Vec<u64>,
+    /// Coverage table
+    pub coverage_table: Vec<(AtomicU64, AtomicU64)>,
+
+    /// Coverage log file
+    coverage_log: Mutex<File>,
 
     /// Active compile jobs
     compile_jobs: Mutex<BTreeSet<u128>>,
+}
+
+impl InputDatabase for Corpus {
+    fn num_inputs(&self) -> usize { self.inputs.len() }
+    fn input(&self, idx: usize) -> Option<&[u8]> {
+        self.inputs.get(idx).map(|x| {
+            &x.data[..]
+        })
+    }   
 }
 
 fn malloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
@@ -589,11 +700,11 @@ fn malloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
         Ok(())
     } else {
         // Cannot satisfy allocation, return out
-        Err(VmExit::Exit)
+        Err(VmExit::OutOfMemory)
     }
 }
 
-fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+fn _calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     let nmemb = emu.reg(Register::A1) as usize;
     let size  = emu.reg(Register::A2) as usize;
 
@@ -607,7 +718,7 @@ fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 
     if result.0 == 0 {
         // Cannot satisfy allocation, return out
-        return Err(VmExit::Exit);
+        return Err(VmExit::OutOfMemory);
     }
 
     if VERBOSE_ALLOCS {
@@ -620,7 +731,7 @@ fn calloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     Ok(())
 }
 
-fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
+fn _realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     let old_alc = VirtAddr(emu.reg(Register::A1) as usize);
     let size    = emu.reg(Register::A2) as usize;
 
@@ -667,7 +778,7 @@ fn realloc_bp(emu: &mut Emulator) -> Result<(), VmExit> {
     
     if new_alc.0 == 0 {
         // Cannot satisfy allocation, return out
-        return Err(VmExit::Exit);
+        return Err(VmExit::OutOfMemory);
     }
 
     emu.set_reg(Register::A0, new_alc.0 as u64);
@@ -681,7 +792,7 @@ fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
         if VERBOSE_ALLOCS {
             print!("free {:#018x}\n", base.0);
         }
-        emu.memory.free(base)?;
+        //emu.memory.free(base)?;
     }
     emu.set_reg(Register::Pc, emu.reg(Register::Ra));
     Ok(())
@@ -689,6 +800,10 @@ fn free_bp(emu: &mut Emulator) -> Result<(), VmExit> {
 
 fn _end_case(_emu: &mut Emulator) -> Result<(), VmExit> {
     Err(VmExit::Exit)
+}
+
+fn snapshot(_emu: &mut Emulator) -> Result<(), VmExit> {
+    Err(VmExit::Snapshot)
 }
 
 pub fn load_elf<P: AsRef<Path>>(filename: P, emu: &mut Emulator)
@@ -792,37 +907,46 @@ fn main() -> io::Result<()> {
         hasher: FalkHasher::new(),
         unique_crashes: Aht::new(),
         code_coverage: Aht::new(),
+        coverage: Aht::new(),
+        corpus: AtomicVec::new(),
+        coverage_log: Mutex::new(File::create("coverage.txt")
+            .expect("Failed to create coverage file")),
         compile_jobs: Default::default(),
-        coverage_bitmap: vec![0u64; 1024 * 1024],
+        coverage_table: (0..32 * 1024 * 1024).map(|_| {
+            (AtomicU64::new(COVERAGE_ENTRY_EMPTY), AtomicU64::new(0))
+        }).collect(),
     });
     
+    // Create a JIT cache
+    let _jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
+
+    // Create an emulator using the JIT
+    let emu = Emulator::new(128 * 1024 * 1024);
+    let mut emu = if REPRO_MODE.is_some() {
+        emu
+    } else {
+        emu.enable_jit(_jit_cache)
+    };
+   
     // Load the initial corpus
     for filename in std::fs::read_dir("inputs")?{
         let filename = filename?.path();
         let data = std::fs::read(filename)?;
-        let hash = corpus.hasher.hash(&data);
 
-        // Save the input and log it in the hash table
-        corpus.input_hashes.entry_or_insert(&hash, hash as usize, || {
-            corpus.inputs.push(Box::new(data));
-            Box::new(())
-        });
+        // Add the corpus input to the corpus
+        corpus.corpus.push(Box::new(data));
     }
 
-    // Create a JIT cache
-    let jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
-
-    // Create an emulator using the JIT
-    let mut emu = Emulator::new(1024 * 1024 * 1024).enable_jit(jit_cache);
-
     // Load the ELF into the memory
-    load_elf("./objdump_riscv", &mut emu)?;
+    load_elf("libtiff", &mut emu)?;
     
     // Register breakpoints
     emu.add_breakpoint(emu.resolve_symbol("_malloc_r").unwrap(), malloc_bp);
-    emu.add_breakpoint(emu.resolve_symbol("_calloc_r").unwrap(), calloc_bp);
-    emu.add_breakpoint(emu.resolve_symbol("_realloc_r").unwrap(), realloc_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_calloc_r").unwrap(), _calloc_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_realloc_r").unwrap(), _realloc_bp);
     emu.add_breakpoint(emu.resolve_symbol("_free_r").unwrap(), free_bp);
+    emu.add_breakpoint(emu.resolve_symbol("_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE").unwrap(), snapshot);
+    //emu.add_breakpoint(emu.resolve_symbol("fuzzme").unwrap(), snapshot);
 
     // Set up a stack
     let stack = emu.memory.allocate(32 * 1024)
@@ -836,11 +960,7 @@ fn main() -> io::Result<()> {
         .expect("Failed to write program name");
     let arg1 = emu.memory.allocate(4096)
         .expect("Failed to allocate arg1");
-    emu.memory.write_from(arg1, b"-g\0")
-        .expect("Failed to write arg1");
-    let arg2 = emu.memory.allocate(4096)
-        .expect("Failed to allocate arg1");
-    emu.memory.write_from(arg2, b"testfn\0")
+    emu.memory.write_from(arg1, b"testfn\0")
         .expect("Failed to write arg2");
 
     macro_rules! push {
@@ -857,10 +977,9 @@ fn main() -> io::Result<()> {
     push!(0u64);   // Auxp
     push!(0u64);   // Envp
     push!(0u64);   // Argv end
-    push!(arg2.0); // Argv
     push!(arg1.0); // Argv
     push!(progname.0); // Argv
-    push!(3u64);   // Argc
+    push!(2u64);   // Argc
 
     loop {
         // Run the emulator to a certain point
@@ -869,12 +988,13 @@ fn main() -> io::Result<()> {
             .expect_err("Failed to execute emulator");
 
         match vmexit {
+            VmExit::Snapshot => {
+                emu.remove_breakpoint(emu.resolve_symbol("_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE").unwrap());
+                //emu.remove_breakpoint(emu.resolve_symbol("fuzzme").unwrap());
+                break;
+            }
             VmExit::Syscall => {
                 print!("Syscall {}\n", emu.reg(Register::A7));
-                if emu.reg(Register::A7) == 1024 {
-                    break;
-                }
-
                 if let Err(_vmexit) = handle_syscall(&mut emu) {
                     break;
                 }
@@ -929,15 +1049,22 @@ fn main() -> io::Result<()> {
                         stats.total_cycles as f64;
 
                     print!("[{:10.4}] cases {:10} | inputs {:10} | \
-                            unique crashes {:10} | \
-                            fcps {:10.1} | code {:10} | Minst/sec {:10.1} | \
+                            crashes {:8} | \
+                            fcps {:8.0} | code {:7} | cov {:10} | \
+                            Minst/sec {:10.1} | \
                             reset {:8.4} | vm {:8.4}\n",
                            elapsed, fuzz_cases, corpus.inputs.len(),
                            corpus.unique_crashes.len(),
                            fuzz_cases as f64 / elapsed,
                            corpus.code_coverage.len(),
+                           corpus.coverage.len(),
                            instrs as f64 / elapsed / 1_000_000.,
                            resetc, vmc);
+
+                    for (vmexit, &freq) in stats.vmexits.iter() {
+                        print!("{:15} [{:8.6}] {:x?}\n",
+                               freq, freq as f64 / fuzz_cases as f64, vmexit);
+                    }
 
                     last_time = Instant::now();
                 }
@@ -949,7 +1076,7 @@ fn main() -> io::Result<()> {
     let num_cores = if REPRO_MODE.is_some() {
         1
     } else {
-        192
+        1
     };
 
     for _ in 0..num_cores {

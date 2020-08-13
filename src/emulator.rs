@@ -1,22 +1,38 @@
 //! A 64-bit RISC-V RV64i interpreter
 
+use std::io::Write;
 use std::fmt;
-use std::mem::size_of_val;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::path::Path;
 use std::time::Duration;
 use std::process::Command;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::rdtsc;
-use crate::Corpus;
+use crate::{Input, Corpus};
 use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC, PERM_RAW};
-use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE};
+use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE, PERM_ACC};
 use crate::jitcache::JitCache;
+
+/// If `true` compares will generate coverage for each unique combination of
+/// matching bytes during conditional branches. This means that as more bytes
+/// are found to match, coverage events will be generated and the input will
+/// be saved.
+const COMPARE_COVERAGE: bool = false;
 
 /// If set, all register state will be saved before the execution of every
 /// instruction.
 /// This is INCREDIBLY slow and should only be used for debugging
 const ENABLE_TRACING: bool = false;
+
+/// Depth of the call stack for the program under test
+const MAX_CALL_STACK: usize = 16 * 1024;
+
+/// Indicates that a coverage entry is empty
+pub const COVERAGE_ENTRY_EMPTY: u64 = 0xe66dd519dba260bb;
+
+/// Indicates that a coverage entry is currently being populated
+pub const COVERAGE_ENTRY_PENDING: u64 = 0xe66dd519dba260bc;
 
 /// Make sure this stays in sync with the C++ JIT version of this structure
 #[repr(C)]
@@ -32,6 +48,18 @@ pub enum ExitReason {
     Breakpoint,
     InvalidOpcode,
     Coverage,
+    CmpCoverage,
+    CallStackFull,
+}
+
+/// Different types of coverage
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageType {
+    /// Coverage from new code being hit
+    Code,
+
+    /// Coverage from unique compares
+    Compare,
 }
 
 /// Make sure this stays in sync with the C++ JIT version of this structure
@@ -51,9 +79,15 @@ struct GuestState {
     trace_buffer:  usize,
     trace_idx:     usize,
     trace_len:     usize,
-    cov_bitmap:    usize,
+    cov_table:     usize,
     instrs_execed: u64,
     timeout:       u64,
+
+    call_stack:      [u64; MAX_CALL_STACK],
+    call_stack_ents: usize,
+    call_stack_hash: u64,
+
+    path_hash: u64,
 }
 
 impl Default for GuestState {
@@ -72,9 +106,15 @@ impl Default for GuestState {
             trace_buffer:  0,
             trace_idx:     0,
             trace_len:     0,
-            cov_bitmap:    0,
+            cov_table:     0,
             instrs_execed: 0,
-            timeout:       1_500_000_000,
+            timeout:       10_000_000,
+
+            call_stack:      [0; MAX_CALL_STACK],
+            call_stack_ents: 0,
+            call_stack_hash: 0,
+
+            path_hash: 0,
         }
     }
 }
@@ -252,6 +292,9 @@ pub struct Emulator {
     /// Fuzz input for the program
     pub fuzz_input: Vec<u8>,
 
+    /// Number of resets on this emulator, not copied on a fork
+    resets: u64,
+
     /// File handle table (indexed by file descriptor)
     pub files: Files,
 
@@ -270,9 +313,16 @@ pub struct Emulator {
     /// Trace of register states prior to every instruction execution
     /// Only allocated if `ENABLE_TRACING` is `true`
     trace: Vec<[u64; 33]>,
+
+    /// Tracks if the current fuzz case has generated new unique coverage.
+    /// If `Some`, contains the instruction count of the most recent coverage
+    /// increase.
+    /// This allows us to defer reporting the input until the case is complete,
+    /// and thus we can latch the timeout which was used to hit the coverage.
+    new_coverage: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 /// Reasons why the VM exited
 pub enum VmExit {
     /// The VM exited due to a syscall instruction
@@ -315,19 +365,36 @@ pub enum VmExit {
     
     /// An write of `VirtAddr` failed due to missing permissions
     WriteFault(VirtAddr),
+
+    /// Used by breakpoints to indicate to take a snapshot
+    Snapshot,
+
+    /// The call stack was exhausted, likely infinite recursion or an uncommon
+    /// call/ret instruction sequence leading to a broken call stack
+    CallStackFull,
+
+    /// The guest ran out of virtual memory and could not continue
+    OutOfMemory,
 }
 
 /// Different types of faults
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FaultType {
-    // Access occurred outside of program memory
+    /// Access occurred outside of program memory
     Bounds,
 
-    // Invalid free (eg, double free or corrupt free address)
+    /// Invalid free (eg, double free or corrupt free address)
     Free,
 
-    // An invalid opcode was executed (or lifted)
+    /// An invalid opcode was executed (or lifted)
     InvalidOpcode,
+
+    /// A breakpoint occurred in the target binary
+    SoftwareBreakpoint,
+
+    /// The call stack was exhausted, likely infinite recursion or an uncommon
+    /// call/ret instruction sequence leading to a broken call stack
+    CallStackFull,
 
     Exec,
     Read,
@@ -336,7 +403,7 @@ pub enum FaultType {
 }
 
 /// Different buckets for addresses
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AddressType {
     /// Address was between [0, 32 KiB)
     Null,
@@ -370,6 +437,10 @@ impl VmExit {
             VmExit::InvalidFree(addr)    => Some((FaultType::Free,   addr)),
             VmExit::InvalidOpcode =>
                 Some((FaultType::InvalidOpcode, VirtAddr(0))),
+            VmExit::Ebreak =>
+                Some((FaultType::SoftwareBreakpoint, VirtAddr(0))),
+            VmExit::CallStackFull =>
+                Some((FaultType::CallStackFull, VirtAddr(0))),
             _ => None,
         }
     }
@@ -478,21 +549,36 @@ impl Emulator {
         assert!(size >= 8, "Must have at least 8 bytes of memory");
 
         Emulator {
-            memory: Mmu::new(size),
-            state:  GuestState::default(),
-            fuzz_input: Vec::new(),
+            memory:          Mmu::new(size),
+            state:           GuestState::default(),
+            fuzz_input:      Vec::new(),
+            jit_cache:       None,
+            breakpoints:     BTreeMap::new(),
+            symbols:         BTreeMap::new(),
+            vaddr_to_symbol: BTreeMap::new(),
+            resets:          0,
+            new_coverage:    None,
+            trace: Vec::with_capacity(
+                if ENABLE_TRACING { 10_000_000 } else { 0 }),
             files: Files(vec![
                 Some(EmuFile::Stdin),
                 Some(EmuFile::Stdout),
                 Some(EmuFile::Stderr),
             ]),
-            jit_cache: None,
-            breakpoints: BTreeMap::new(),
-            symbols: BTreeMap::new(),
-            vaddr_to_symbol: BTreeMap::new(),
-            trace: Vec::with_capacity(
-                if ENABLE_TRACING { 10_000_000 } else { 0 }),
         }
+    }
+    
+    /// Get the current timeout for the fuzz case. This may change during the
+    /// fuzz case if we keep exploring new coverage, we may increase the
+    /// timeout.
+    pub fn timeout(&self) -> u64 {
+        self.state.timeout
+    }
+
+    /// Set the timeout for the fuzz case in number of instructions, this will
+    /// be reset to the default value upon a `reset()`
+    pub fn set_timeout(&mut self, timeout: u64) {
+        self.state.timeout = timeout;
     }
 
     /// Add a symbol to the symbol database
@@ -544,6 +630,8 @@ impl Emulator {
             breakpoints:     self.breakpoints.clone(),
             symbols:         self.symbols.clone(),
             vaddr_to_symbol: self.vaddr_to_symbol.clone(),
+            resets:          0,
+            new_coverage:    None,
             trace: Vec::with_capacity(
                 if ENABLE_TRACING { 10_000_000 } else { 0 }),
         }
@@ -561,19 +649,27 @@ impl Emulator {
         self.breakpoints.insert(pc, callback);
     }
 
+    /// Removes a breakpoint, returns `true` if a previous breakpoint was
+    /// removed
+    pub fn remove_breakpoint(&mut self, pc: VirtAddr) -> bool {
+        self.breakpoints.remove(&pc).is_some()
+    }
+
     /// Reset the state of `self` to `other`, assuming that `self` is
     /// forked off of `other`. If it is not, the results are invalid.
-    pub fn reset(&mut self, other: &Self) {
+    pub fn reset<F>(&mut self, other: &Self, corpus: &Corpus,
+                    accessed_bits: F)
+            where F: FnOnce(&mut Emulator) -> Vec<bool> {
         if ENABLE_TRACING {
             let mut tracestr = String::new();
             let mut pctracestr = String::new();
             for trace in &self.trace {
                 self.state.regs = *trace;
-                tracestr += &format!("{}\n", self);
+                let sym = self.get_symbol(VirtAddr(
+                        self.reg(Register::Pc) as usize));
+                tracestr += &format!("\n{}\n{}\n", sym, self);
                 pctracestr += &format!("{:016x} {}\n",
-                    self.reg(Register::Pc),
-                    self.get_symbol(VirtAddr(self.reg(Register::Pc) as usize))
-                );
+                    self.reg(Register::Pc), sym);
             }
             if self.trace.len() > 0 {
                 std::fs::write("trace.txt", tracestr).unwrap();
@@ -585,15 +681,47 @@ impl Emulator {
             self.trace.clear();
         }
 
+        // Check if the input for this fuzz case should be saved
+        if let Some(instrs) = self.new_coverage {
+            // Save the input and log it in the hash table
+            let hash = corpus.hasher.hash(&self.fuzz_input);
+            corpus.input_hashes.entry_or_insert(
+                    &hash, hash as usize, || {
+                corpus.inputs.push(
+                    Box::new(Input::new(instrs, self.fuzz_input.clone(),
+                             accessed_bits(self))));
+                Box::new(())
+            });
+
+            // Reset that the case found new coverage
+            self.new_coverage = None;
+        }
+
+        // Restore original timeout
+        self.state.timeout = other.state.timeout;
+
         // Reset memory state
         self.memory.reset(&other.memory);
 
         // Reset register state
         self.state.regs = other.state.regs;
 
+        // Reset call stack
+        let cse = other.state.call_stack_ents as usize;
+        self.state.call_stack[..cse]
+            .copy_from_slice(&other.state.call_stack[..cse]);
+        self.state.call_stack_ents = other.state.call_stack_ents;
+        self.state.call_stack_hash = other.state.call_stack_hash;
+
+        // Reset path hash
+        self.state.path_hash = other.state.path_hash;
+
         // Reset file state
         self.files.0.clear();
         self.files.0.extend_from_slice(&other.files.0);
+
+        // Update some stats
+        self.resets += 1;
     }
 
     /// Allocate a new file descriptor
@@ -641,6 +769,63 @@ impl Emulator {
         }
     }
 
+    /// Used interally by the emulator and JIT to notify us when new code
+    /// coverage is hit
+    fn notify_code_coverage(&mut self, corpus: &Corpus, from: u64, to: u64) {
+        // Update code coverage
+        let key = (
+            VirtAddr(from as usize),
+            VirtAddr(to   as usize),
+        );
+        corpus.code_coverage.entry_or_insert(
+            &key, to as usize, || {
+                {
+                    let new_cov = format!("{:10} {:10} {:#x} {} -> {:#x} {}",
+                        self.resets + 1,
+                        corpus.code_coverage.len() + 1,
+                        from, self.get_symbol(VirtAddr(from as usize)),
+                        to, self.get_symbol(VirtAddr(to as usize)));
+                    let mut cl =
+                        corpus.coverage_log.lock().unwrap();
+                    write!(cl, "{}\n", new_cov).unwrap();
+                }
+
+                // Indicate that this case caused new coverage
+                self.new_coverage = Some(self.state.instrs_execed);
+
+                // Increase timeout temporarly for this fuzz case
+                // to explore more around the new code
+                self.state.timeout += 1_000_000;
+
+                Box::new(())
+            });
+    }
+
+    /// Register that new compare coverage has occurred
+    fn notify_compare_coverage(&mut self, _corpus: &Corpus) {
+        /*
+        let key = (
+            CoverageType::Compare,
+            self.state.cov_from,
+            self.state.cov_to,
+            (self.state.call_stack_hash & 0xf) ^
+                (self.state.path_hash & 0xf),
+        );
+
+        // Update code coverage
+        corpus.coverage.entry_or_insert(
+            &key, self.state.cov_from as usize, || {
+                // Indicate that this case caused new coverage
+                self.new_coverage = Some(self.state.instrs_execed);
+
+                // Increase timeout temporarly for this fuzz case
+                // to explore more around the new code
+                self.state.timeout += 1_000_000;
+
+                Box::new(())
+            });*/
+    }
+
     /// Run the VM using the emulator
     pub fn run_emu(&mut self, instrs_execed: &mut u64, corpus: &Corpus)
             -> Result<(), VmExit> {
@@ -659,6 +844,90 @@ impl Emulator {
                                                    Perm(PERM_EXEC))
                 .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
 
+            macro_rules! coverage_event {
+                ($cov_source:expr, $from:expr, $to:expr) => {
+                    // Check for timeout
+                    if *instrs_execed > self.state.timeout {
+                        return Err(VmExit::Timeout);
+                    }
+
+                    // Update the path hash
+                    self.state.path_hash =
+                        self.state.path_hash.rotate_left(7) ^ $to;
+    
+                    const PRIME64_2: u64 = 0xC2B2AE3D27D4EB4F;
+                    const PRIME64_3: u64 = 0x165667B19E3779F9;
+
+                    // Get access to the coverage table
+                    let ct = &corpus.coverage_table;
+                    
+                    // Compute the hash
+                    let mut hash: u64 = $from;
+                    hash ^= hash >> 33;
+                    hash *= PRIME64_2;
+                    hash += $to;
+                    hash ^= hash >> 29;
+                    hash *= PRIME64_3;
+                    hash ^= hash >> 32;
+                    
+                    // Convert the hash to a `usize`
+                    let mut hash = hash as usize;
+
+                    loop {
+                        // Bounds the hash to the table
+                        hash %= ct.len();
+
+                        if ct[hash].0.compare_and_swap(COVERAGE_ENTRY_EMPTY,
+                                COVERAGE_ENTRY_PENDING, Ordering::SeqCst) ==
+                                COVERAGE_ENTRY_EMPTY {
+                            // We own the entry, fill it in
+                            ct[hash].1.store($to,   Ordering::SeqCst);
+                            ct[hash].0.store($from, Ordering::SeqCst);
+                            self.notify_code_coverage(corpus, $from, $to);
+                        } else {
+                            // We lost the race
+
+                            // Wait for the entry to be filled in
+                            while ct[hash].0.load(Ordering::SeqCst) ==
+                                COVERAGE_ENTRY_PENDING {}
+
+                            if ct[hash].0.load(Ordering::Relaxed) == $from &&
+                                    ct[hash].1.load(Ordering::Relaxed) == $to {
+                                // Coverage already recorded
+                                break;
+                            }
+
+                            // Go to the next
+                            hash += 1;
+                        }
+                    }
+                }
+            }
+        
+            macro_rules! compare_coverage {
+                ($a:expr, $b:expr) => {
+                    if COMPARE_COVERAGE {
+                        // Create a bitmap indicating which bytes in rs1 and
+                        // rs2 match
+                        let tmp = $a ^ (!$b);
+                        let tmp = (tmp >> 1) & tmp;
+                        let tmp = (tmp >> 2) & tmp;
+                        let tmp = (tmp >> 4) & tmp;
+                        let tmp = tmp & 0x0101010101010101;
+                        let hash =
+                            pc ^ (self.state.call_stack_hash & 0xff) ^
+                            self.state.path_hash & 0xff;
+
+                        // Register the coverage as compare coverage for this
+                        // PC with the bitmask we identified
+                        coverage_event!("CmpCoverage", hash, tmp);
+                    }
+                }
+            }
+            
+            // Update number of instructions executed
+            *instrs_execed += 1;
+
             //print!("Executing {:#x}\n", pc);
             if ENABLE_TRACING {
                 self.trace.push(self.state.regs);
@@ -675,13 +944,8 @@ impl Emulator {
                 }
             }
 
-            // Update number of instructions executed
-            *instrs_execed += 1;
-
             // Extract the opcode from the instruction
             let opcode = inst & 0b1111111;
-
-            //print!("{}\n\n", self);
 
             match opcode {
                 0b0110111 => {
@@ -697,10 +961,30 @@ impl Emulator {
                 }
                 0b1101111 => {
                     // JAL
-                    let inst = Jtype::from(inst);
-                    self.set_reg(inst.rd, pc.wrapping_add(4));
-                    self.set_reg(Register::Pc,
-                                 pc.wrapping_add(inst.imm as i64 as u64));
+                    let inst    = Jtype::from(inst);
+                    let tgt     = pc.wrapping_add(inst.imm as i64 as u64);
+                    let retaddr = pc.wrapping_add(4);
+
+                    coverage_event!("Coverage", pc, tgt);
+
+                    if inst.rd == Register::Ra {
+                        if self.state.call_stack_ents >= MAX_CALL_STACK {
+                            return Err(VmExit::CallStackFull);
+                        }
+
+                        // Update call stack
+                        self.state.call_stack[self.state.call_stack_ents] =
+                            retaddr;
+                        self.state.call_stack_ents += 1;
+
+                        // Update call stack hash
+                        self.state.call_stack_hash =
+                            self.state.call_stack_hash.rotate_left(7) ^
+                            retaddr;
+                    }
+
+                    self.set_reg(inst.rd, retaddr);
+                    self.set_reg(Register::Pc, tgt);
                     continue 'next_inst;
                 }
                 0b1100111 => {
@@ -712,7 +996,23 @@ impl Emulator {
                             // JALR
                             let target = self.reg(inst.rs1).wrapping_add(
                                     inst.imm as i64 as u64);
-                            self.set_reg(inst.rd, pc.wrapping_add(4));
+
+                            // Try to handle returns for checking to see if
+                            // we're indirectly branching to a return address
+                            if self.state.call_stack_ents > 0 {
+                                let cse = self.state.call_stack_ents - 1;
+                                if target == self.state.call_stack[cse] {
+                                    self.state.call_stack_hash =
+                                        (self.state.call_stack_hash ^ target)
+                                        .rotate_right(7);
+                                    self.state.call_stack_ents -= 1;
+                                }
+                            }
+
+                            coverage_event!("Coverage", pc, target);
+
+                            let retaddr = pc.wrapping_add(4);
+                            self.set_reg(inst.rd, retaddr);
                             self.set_reg(Register::Pc, target);
                             continue 'next_inst;
                         }
@@ -725,57 +1025,29 @@ impl Emulator {
 
                     let rs1 = self.reg(inst.rs1);
                     let rs2 = self.reg(inst.rs2);
+                    let tgt = pc.wrapping_add(inst.imm as i64 as u64);
 
-                    match inst.funct3 {
-                        0b000 => {
-                            // BEQ
-                            if rs1 == rs2 {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
-                        0b001 => {
-                            // BNE
-                            if rs1 != rs2 {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
-                        0b100 => {
-                            // BLT
-                            if (rs1 as i64) < (rs2 as i64) {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
-                        0b101 => {
-                            // BGE
-                            if (rs1 as i64) >= (rs2 as i64) {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
-                        0b110 => {
-                            // BLTU
-                            if (rs1 as u64) < (rs2 as u64) {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
-                        0b111 => {
-                            // BGEU
-                            if (rs1 as u64) >= (rs2 as u64) {
-                                self.set_reg(Register::Pc,
-                                    pc.wrapping_add(inst.imm as i64 as u64));
-                                continue 'next_inst;
-                            }
-                        }
+                    // Determine if we should take a branch
+                    let take_branch = match inst.funct3 {
+                        0b000 => /* BEQ  */ rs1 == rs2,
+                        0b001 => /* BNE  */ rs1 != rs2,
+                        0b100 => /* BLT  */ (rs1 as i64) <  (rs2 as i64),
+                        0b101 => /* BGE  */ (rs1 as i64) >= (rs2 as i64),
+                        0b110 => /* BLTU */ (rs1 as u64) <  (rs2 as u64),
+                        0b111 => /* BGEU */ (rs1 as u64) >= (rs2 as u64),
                         _ => unimplemented!("Unexpected 0b1100011"),
+                    };
+
+                    // Generate compare coverage
+                    compare_coverage!(rs1, rs2);
+
+                    // Handle the conditional branch
+                    if take_branch {
+                        coverage_event!("Coverage", pc, tgt);
+                        self.set_reg(Register::Pc, tgt);
+                        continue 'next_inst;
+                    } else {
+                        coverage_event!("Coverage", pc, pc.wrapping_add(4));
                     }
                 }
                 0b0000011 => {
@@ -887,6 +1159,7 @@ impl Emulator {
                         }
                         0b010 => {
                             // SLTI
+                            compare_coverage!(rs1, imm as u64);
                             if (rs1 as i64) < (imm as i64) {
                                 self.set_reg(inst.rd, 1);
                             } else {
@@ -895,6 +1168,7 @@ impl Emulator {
                         }
                         0b011 => {
                             // SLTIU
+                            compare_coverage!(rs1, imm as u64);
                             if (rs1 as u64) < (imm as u64) {
                                 self.set_reg(inst.rd, 1);
                             } else {
@@ -969,6 +1243,7 @@ impl Emulator {
                         }
                         (0b0000000, 0b010) => {
                             // SLT
+                            compare_coverage!(rs1, rs2);
                             if (rs1 as i64) < (rs2 as i64) {
                                 self.set_reg(inst.rd, 1);
                             } else {
@@ -977,6 +1252,7 @@ impl Emulator {
                         }
                         (0b0000000, 0b011) => {
                             // SLTU
+                            compare_coverage!(rs1, rs2);
                             if (rs1 as u64) < (rs2 as u64) {
                                 self.set_reg(inst.rd, 1);
                             } else {
@@ -1064,7 +1340,7 @@ impl Emulator {
                         return Err(VmExit::Syscall);
                     } else if inst == 0b00000000000100000000000001110011 {
                         // EBREAK
-                        panic!("EBREAK");
+                        return Err(VmExit::Ebreak);
                     } else {
                         unreachable!();
                     }
@@ -1170,8 +1446,8 @@ impl Emulator {
             self.state.trace_buffer  = self.trace.as_ptr() as usize;
             self.state.trace_idx     = self.trace.len();
             self.state.trace_len     = self.trace.capacity();
-            self.state.cov_bitmap    =
-                corpus.coverage_bitmap.as_ptr() as usize;
+            self.state.cov_table     =
+                corpus.coverage_table.as_ptr() as usize;
                     
             let jit_cache = self.jit_cache.as_ref().unwrap();
 
@@ -1219,27 +1495,15 @@ impl Emulator {
 
             match self.state.exit_reason {
                 ExitReason::None => unreachable!(),
+                ExitReason::CallStackFull => {
+                    return Err(VmExit::CallStackFull);
+                }
+                ExitReason::CmpCoverage => {
+                    self.notify_compare_coverage(corpus);
+                }
                 ExitReason::Coverage => {
-                    // Update code coverage
-                    let key = (
-                        VirtAddr(self.state.cov_from as usize),
-                        VirtAddr(self.state.cov_to as usize),
-                    );
-                    corpus.code_coverage.entry_or_insert(
-                        &key, self.state.cov_to as usize, || {
-                            // Save the input and log it in the hash table
-                            let hash = corpus.hasher.hash(&self.fuzz_input);
-                            corpus.input_hashes.entry_or_insert(
-                                    &hash, hash as usize, || {
-                                corpus.inputs.push(
-                                    Box::new(self.fuzz_input.clone()));
-                                Box::new(())
-                            });
-
-                            Box::new(())
-                        });
-
-                    // Fall through to re-execute instruction
+                    self.notify_code_coverage(corpus,
+                        self.state.cov_from, self.state.cov_to);
                 }
                 ExitReason::IndirectBranch => {
                     // Just fall through to translate to JIT
@@ -1307,11 +1571,11 @@ impl Emulator {
 
         let mut program = String::new();
         program += 
-r#"
+&format!(r#"
 #include <stddef.h>
 #include <stdint.h>
 
-enum _vmexit {
+enum _vmexit {{
     None,
     IndirectBranch,
     ReadFault,
@@ -1322,9 +1586,11 @@ enum _vmexit {
     Breakpoint,
     InvalidOpcode,
     Coverage,
-};
+    CmpCoverage,
+    CallStackFull,
+}};
 
-struct _state {
+struct _state {{
     enum _vmexit exit_reason;
     uint64_t     reenter_pc;
 
@@ -1341,13 +1607,25 @@ struct _state {
     uint64_t *__restrict const trace_buffer;
     size_t trace_idx;
     const size_t trace_len;
-    uint64_t *const cov_bitmap;
+    uint64_t (*const cov_table)[2];
     uint64_t instrs_execed;
     const uint64_t timeout;
-};
 
-extern "C" void start(struct _state *__restrict state) {
-"#;
+    uint64_t call_stack[{MAX_CALL_STACK}];
+    uint64_t call_stack_ents;
+    uint64_t call_stack_hash;
+
+    uint64_t path_hash;
+}};
+
+static uint64_t rotl64 (uint64_t x, uint64_t n);
+static uint64_t rotr64 (uint64_t x, uint64_t n);
+    
+const uint64_t PRIME64_2 = 0xC2B2AE3D27D4EB4FULL;
+const uint64_t PRIME64_3 = 0x165667B19E3779F9ULL;
+
+extern "C" void start(struct _state *__restrict state) {{
+"#, MAX_CALL_STACK = MAX_CALL_STACK);
 
         macro_rules! set_reg {
             ($reg:expr, $expr:expr) => {
@@ -1391,42 +1669,96 @@ extern "C" void start(struct _state *__restrict state) {
             }
         }
 
+        macro_rules! compare_coverage {
+            ($a:expr, $b:expr) => {
+                if COMPARE_COVERAGE {
+                    // Create a bitmap indicating which bytes in rs1 and
+                    // rs2 match
+                    program += &format!("auto tmp1 = ({}) ^ (~({}));",
+                        $a, $b);
+                    program += "auto tmp2 = (tmp1 >> 1) & tmp1;";
+                    program += "auto tmp3 = (tmp2 >> 2) & tmp2;";
+                    program += "auto tmp4 = (tmp3 >> 4) & tmp3;";
+                    program += "auto res  = tmp4 & 0x0101010101010101ULL;";
+
+                    // Register the coverage as compare coverage for this
+                    // PC with the bitmask we identified
+                    coverage_event!("CmpCoverage",
+                        format!(
+                            "{:#x}ULL ^ (state->call_stack_hash & 0xff) ^ \
+                             (state->path_hash & 0xff)", pc.0), "res");
+                }
+            }
+        }
+
         while let Some(pc) = queued.pop_front() {
             // Attempt to notify of a coverage edge ($from, $to)
             // Note: This will cause the current instruction to be re-executed
             // if the coverage is new. Thus, it is critical that no side
             // effects occur prior to the coverage_event!() macro use.
             macro_rules! coverage_event {
-                ($from:expr, $to:expr) => {
-                    let coverage_bitmap_bits =
-                        size_of_val(corpus.coverage_bitmap.as_slice()) * 8;
-                    assert!(coverage_bitmap_bits.count_ones() == 1,
-                        "Coverage bitmap must be a power of two");
-                    program += &format!(r#"
-        if (state->instrs_execed > state->timeout) {{
-            state->exit_reason = Timeout;
-            state->reenter_pc  = {pc:#x}ULL;
-            return;
-        }}
+                ($cov_source:expr, $from:expr, $to:expr) => {
+                    program += &format!(
+r#"{{
+    // Check for timeout
+    if(state->instrs_execed > state->timeout) {{
+        state->exit_reason = Timeout;
+        state->reenter_pc  = {pc:#x}ULL;
+        return;
+    }}
 
-        auto hash = ({from} ^ 0xe66dd519dba260bbULL) ^
-            ({to} ^ 0xa50ec1c4a4065d15ULL);
-        hash ^= hash << 13;
-        hash ^= hash >> 17;
-        hash ^= hash << 43;
-        hash &= {hashmask};
-        auto idx = hash / 64;
-        auto bit = 1ULL << (hash % 64);
-        if ((state->cov_bitmap[idx] & bit) == 0) {{
-            state->cov_bitmap[idx] |= bit;
-            state->exit_reason = Coverage;
+    // Update the path hash
+    state->path_hash =
+        rotl64(state->path_hash, 7) ^ ({to});
+ 
+    // Compute the hash
+    uint64_t hash = {from};
+    hash ^= hash >> 33;
+    hash *= PRIME64_2;
+    hash += {to};
+    hash ^= hash >> 29;
+    hash *= PRIME64_3;
+    hash ^= hash >> 32;
+
+    auto ct = state->cov_table;
+
+    for( ; ; ) {{
+        // Bounds the hash to the table
+        hash %= {cov_table_len}ULL;
+
+        if(ct[hash][0] == {EMPTY}ULL && __sync_val_compare_and_swap(&ct[hash][0], {EMPTY}ULL,
+                {PENDING}ULL) == {EMPTY}ULL) {{
+            // We own the entry, fill it in
+            __atomic_store_n(&ct[hash][1], {to},   __ATOMIC_SEQ_CST);
+            __atomic_store_n(&ct[hash][0], {from}, __ATOMIC_SEQ_CST);
+
+            state->exit_reason = {cov_source};
             state->cov_from    = {from};
             state->cov_to      = {to};
             state->reenter_pc  = {pc:#x}ULL;
             return;
+        }} else {{
+            // We lost the race
+
+            // Wait for the entry to be filled in
+            while(__atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST) ==
+                {PENDING}ULL) {{}}
+
+            uint64_t a = __atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST);
+            uint64_t b = __atomic_load_n(&ct[hash][1], __ATOMIC_SEQ_CST);
+            if(a == ({from}) && b == ({to})) {{
+                // Coverage already recorded
+                break;
+            }}
+
+            // Go to the next
+            hash += 1;
         }}
-    "#, from = $from, to = $to, hashmask = coverage_bitmap_bits - 1,
-        pc = pc.0);
+    }}
+}}"#, cov_source = $cov_source, from = $from, to = $to, pc = pc.0,
+    cov_table_len = corpus.coverage_table.len(),
+    EMPTY = COVERAGE_ENTRY_EMPTY,
+    PENDING = COVERAGE_ENTRY_PENDING);
                 }
             }
 
@@ -1497,9 +1829,23 @@ extern "C" void start(struct _state *__restrict state) {
                     let target  = pc.0.wrapping_add(inst.imm as i64 as usize);
 
                     // Record coverage
-                    coverage_event!(
+                    coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
                         format!("{:#x}ULL", target));
+
+                    if inst.rd == Register::Ra {
+                        program += &format!(r#"
+    if(state->call_stack_ents >= {MAX_CALL_STACK}) {{
+        state->exit_reason = CallStackFull;
+        state->reenter_pc  = {pc:#x}ULL;
+        return;
+    }}
+
+    state->call_stack[state->call_stack_ents++] = {retaddr:#x}ULL;
+    state->call_stack_hash =
+        rotl64(state->call_stack_hash, 7) ^ {retaddr:#x}ULL;
+    "#, MAX_CALL_STACK = MAX_CALL_STACK, pc = pc.0, retaddr = retaddr);
+                    }
 
                     // Set the return address
                     set_reg!(inst.rd, retaddr);
@@ -1535,8 +1881,19 @@ extern "C" void start(struct _state *__restrict state) {
                             program += &format!("    target += {:#x}ULL;\n",
                                 inst.imm as i64 as u64);
 
+                            program += &format!(r#"
+    if(state->call_stack_ents > 0) {{
+        auto cse = state->call_stack_ents - 1;
+        if(target == state->call_stack[cse]) {{
+            state->call_stack_hash =
+                rotr64(state->call_stack_hash ^ target, 7);
+            state->call_stack_ents -= 1;
+        }}
+    }}
+        "#);
+
                             // Record coverage
-                            coverage_event!(
+                            coverage_event!("Coverage",
                                 format!("{:#x}ULL", pc.0),
                                 "target");
 
@@ -1573,11 +1930,15 @@ extern "C" void start(struct _state *__restrict state) {
 
                     get_reg!("auto rs1", inst.rs1);
                     get_reg!("auto rs2", inst.rs2);
+
+                    // Generate compare coverage
+                    compare_coverage!("rs1", "rs2");
+
                     program += &format!("    if (({})rs1 {} ({})rs2) {{\n",
                         cmptyp, cmpop, cmptyp);
 
                     // Record coverage for true condition
-                    coverage_event!(
+                    coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
                         format!("{:#x}ULL", target));
 
@@ -1586,7 +1947,7 @@ extern "C" void start(struct _state *__restrict state) {
                     program += "    }\n";
                     
                     // Record coverage for false condition
-                    coverage_event!(
+                    coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
                         format!("{:#x}ULL", pc.0.wrapping_add(4)));
 
@@ -1610,8 +1971,10 @@ extern "C" void start(struct _state *__restrict state) {
                     
                     // Compute the read permission mask
                     let mut perm_mask = 0u64;
+                    let mut access_mask = 0u64;
                     for ii in 0..access_size {
-                        perm_mask |= (PERM_READ as u64) << (ii * 8)
+                        perm_mask   |= (PERM_READ as u64) << (ii * 8);
+                        access_mask |= (PERM_ACC  as u64) << (ii * 8);
                     }
 
                     // Compute the address
@@ -1627,7 +1990,20 @@ extern "C" void start(struct _state *__restrict state) {
         state->reenter_pc  = {:#x}ULL;
         return;
     }}
-    "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0);
+    
+    // Set the accessed bits
+    auto perms = *({}*)(state->permissions + addr);
+    *({}*)(state->permissions + addr) |= {:#x}ULL;
+
+    auto block = addr / {};
+    auto idx   = block / 64;
+    auto bit   = 1ULL << (block % 64);
+    if((state->dirty_bitmap[idx] & bit) == 0) {{
+        state->dirty[state->dirty_idx++] = block;
+        state->dirty_bitmap[idx] |= bit;
+    }}
+    "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0,
+    loadtyp, loadtyp, access_mask, DIRTY_BLOCK_SIZE);
 
                     set_reg!(inst.rd, format!("*({}*)(state->memory + addr)",
                         loadtyp));
@@ -1702,6 +2078,11 @@ extern "C" void start(struct _state *__restrict state) {
                         0b010 => {
                             // SLTI
                             get_reg!("auto rs1", inst.rs1);
+                    
+                            // Compare coverage
+                            compare_coverage!("rs1",
+                                format!("{:#x}ULL", inst.imm as u64));
+
                             set_reg!(inst.rd,
                                 format!("((int64_t)rs1 < {:#x}LL) ? 1 : 0",
                                 inst.imm as i64));
@@ -1709,6 +2090,11 @@ extern "C" void start(struct _state *__restrict state) {
                         0b011 => {
                             // SLTIU
                             get_reg!("auto rs1", inst.rs1);
+                            
+                            // Compare coverage
+                            compare_coverage!("rs1",
+                                format!("{:#x}ULL", inst.imm as u64));
+
                             set_reg!(inst.rd,
                                 format!("((uint64_t)rs1 < {:#x}ULL) ? 1 : 0",
                                 inst.imm as i64 as u64));
@@ -1797,6 +2183,10 @@ extern "C" void start(struct _state *__restrict state) {
                             // SLT
                             get_reg!("auto rs1", inst.rs1);
                             get_reg!("auto rs2", inst.rs2);
+
+                            // Compare coverage
+                            compare_coverage!("rs1", "rs2");
+
                             set_reg!(inst.rd,
                                 "((int64_t)rs1 < (int64_t)rs2) ? 1 : 0");
                         }
@@ -1804,6 +2194,10 @@ extern "C" void start(struct _state *__restrict state) {
                             // SLTU
                             get_reg!("auto rs1", inst.rs1);
                             get_reg!("auto rs2", inst.rs2);
+                            
+                            // Compare coverage
+                            compare_coverage!("rs1", "rs2");
+
                             set_reg!(inst.rd,
                                 "((uint64_t)rs1 < (uint64_t)rs2) ? 1 : 0");
                         }
@@ -1972,6 +2366,21 @@ extern "C" void start(struct _state *__restrict state) {
 
         // Close the function scope
         program += "}\n";
+
+        // Add functions we use
+        program += r#"
+static uint64_t rotl64 (uint64_t x, uint64_t n) {
+  n &= 0x3f;
+  if(!n) return x;
+  return (x<<n) | (x>>(0x40-n));
+}
+
+static uint64_t rotr64 (uint64_t x, uint64_t n) {
+  n &= 0x3f;
+  if(!n) return x;
+  return (x>>n) | (x<<(0x40-n));
+}
+"#;
         
         // Hash the C++ file contents
         let proghash = corpus.hasher.hash(program.as_bytes());
@@ -2026,6 +2435,7 @@ extern "C" void start(struct _state *__restrict state) {
             "-fno-asynchronous-unwind-tables",
             "-Wno-unused-label",
             "-Wno-unused-variable",
+            "-Wno-unused-function",
             "-Werror",
             "-fno-strict-aliasing",
             "-static", "-nostdlib", "-ffreestanding",
