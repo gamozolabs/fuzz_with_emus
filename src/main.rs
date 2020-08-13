@@ -471,6 +471,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
             // Number of instructions executed this fuzz case
             let mut run_instrs = 0u64;
 
+            /*
             // Clear the fuzz input
             emu.fuzz_input.clear();
             mutator.input.clear();
@@ -520,7 +521,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
             assert!(emu.fuzz_input.len() <= len);
             emu.memory.write_from(VirtAddr(buf as usize), &emu.fuzz_input)
                 .unwrap();
-            emu.set_reg(Register::A1, emu.fuzz_input.len() as u64);
+            emu.set_reg(Register::A1, emu.fuzz_input.len() as u64);*/
 
             let vmexit = loop {
                 let vmexit = emu.run(&mut run_instrs,
@@ -541,7 +542,7 @@ fn worker(mut emu: Emulator, original: Arc<Emulator>,
                     _ => break vmexit,
                 }
             };
-            
+
             if let Some((fault_type, vaddr)) = vmexit.is_crash() {
                 // Update crash stats
                 local_stats.crashes += 1;
@@ -940,13 +941,15 @@ fn main() -> io::Result<()> {
     // Load the ELF into the memory
     load_elf("libtiff", &mut emu)?;
     
+    const FUZZ_START_SYM: &str =
+        "_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE";
+    
     // Register breakpoints
     emu.add_breakpoint(emu.resolve_symbol("_malloc_r").unwrap(), malloc_bp);
     emu.add_breakpoint(emu.resolve_symbol("_calloc_r").unwrap(), _calloc_bp);
     emu.add_breakpoint(emu.resolve_symbol("_realloc_r").unwrap(), _realloc_bp);
     emu.add_breakpoint(emu.resolve_symbol("_free_r").unwrap(), free_bp);
-    emu.add_breakpoint(emu.resolve_symbol("_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE").unwrap(), snapshot);
-    //emu.add_breakpoint(emu.resolve_symbol("fuzzme").unwrap(), snapshot);
+    emu.add_breakpoint(emu.resolve_symbol(FUZZ_START_SYM).unwrap(), snapshot);
 
     // Set up a stack
     let stack = emu.memory.allocate(32 * 1024)
@@ -981,6 +984,7 @@ fn main() -> io::Result<()> {
     push!(progname.0); // Argv
     push!(2u64);   // Argc
 
+
     loop {
         // Run the emulator to a certain point
         let mut tmp = 0;
@@ -989,8 +993,8 @@ fn main() -> io::Result<()> {
 
         match vmexit {
             VmExit::Snapshot => {
-                emu.remove_breakpoint(emu.resolve_symbol("_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE").unwrap());
-                //emu.remove_breakpoint(emu.resolve_symbol("fuzzme").unwrap());
+                emu.remove_breakpoint(
+                    emu.resolve_symbol(FUZZ_START_SYM).unwrap());
                 break;
             }
             VmExit::Syscall => {
@@ -1051,14 +1055,14 @@ fn main() -> io::Result<()> {
                     print!("[{:10.4}] cases {:10} | inputs {:10} | \
                             crashes {:8} | \
                             fcps {:8.0} | code {:7} | cov {:10} | \
-                            Minst/sec {:10.1} | \
+                            eff Minst/sec {:10.1} | \
                             reset {:8.4} | vm {:8.4}\n",
                            elapsed, fuzz_cases, corpus.inputs.len(),
                            corpus.unique_crashes.len(),
                            fuzz_cases as f64 / elapsed,
                            corpus.code_coverage.len(),
                            corpus.coverage.len(),
-                           instrs as f64 / elapsed / 1_000_000.,
+                           (instrs as f64 / elapsed / 1_000_000.) / vmc,
                            resetc, vmc);
 
                     for (vmexit, &freq) in stats.vmexits.iter() {

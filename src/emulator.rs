@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::path::Path;
 use std::time::Duration;
+use std::convert::TryInto;
 use std::process::Command;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::rdtsc;
@@ -14,11 +15,17 @@ use crate::mmu::{VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC, PERM_RAW};
 use crate::mmu::{Mmu, DIRTY_BLOCK_SIZE, PERM_ACC};
 use crate::jitcache::JitCache;
 
+/// If `true` code coverage will be collected
+const CODE_COVERAGE: bool = true;
+
 /// If `true` compares will generate coverage for each unique combination of
 /// matching bytes during conditional branches. This means that as more bytes
 /// are found to match, coverage events will be generated and the input will
 /// be saved.
 const COMPARE_COVERAGE: bool = false;
+
+/// If `true` the call stack will be maintained for the emulated code
+const USE_CALL_STACK: bool = false;
 
 /// If set, all register state will be saved before the execution of every
 /// instruction.
@@ -88,6 +95,8 @@ struct GuestState {
     call_stack_hash: u64,
 
     path_hash: u64,
+
+    blocks: usize,
 }
 
 impl Default for GuestState {
@@ -115,6 +124,8 @@ impl Default for GuestState {
             call_stack_hash: 0,
 
             path_hash: 0,
+
+            blocks: 0,
         }
     }
 }
@@ -427,6 +438,7 @@ impl From<VirtAddr> for AddressType {
 
 impl VmExit {
     /// If this is a crash it returns the faulting address and the fault type
+    #[inline]
     pub fn is_crash(&self) -> Option<(FaultType, VirtAddr)> {
         match *self {
             VmExit::AddressMiss(addr, _) => Some((FaultType::Bounds, addr)),
@@ -1413,7 +1425,7 @@ impl Emulator {
         let mut override_jit_addr = None;
 
         loop {
-            let mut jit_addr = if let Some(override_jit_addr) =
+            let jit_addr = if let Some(override_jit_addr) =
                     override_jit_addr.take() {
                 override_jit_addr
             } else {
@@ -1428,15 +1440,17 @@ impl Emulator {
                     jit_addr
                 } else {
                     // Generate the JIT for this PC
-                    let tmp = self.compile_jit(VirtAddr(pc as usize), corpus)?;
+                    let (jit, entry_points) =
+                        self.compile_jit(VirtAddr(pc as usize), corpus)?;
 
                     // Update the JIT tables
-                    self.jit_cache.as_ref().unwrap().add_mapping(
-                        VirtAddr(pc as usize), &tmp)
+                    self.jit_cache.as_ref().unwrap().add_mappings(
+                        VirtAddr(pc as usize), &jit, &entry_points)
                 }
             };
 
             // Set up the JIT state
+            let jit_cache = self.jit_cache.as_ref().unwrap();
             self.state.instrs_execed = *instrs_execed;
             self.state.memory        = memory;
             self.state.permissions   = perms;
@@ -1446,38 +1460,21 @@ impl Emulator {
             self.state.trace_buffer  = self.trace.as_ptr() as usize;
             self.state.trace_idx     = self.trace.len();
             self.state.trace_len     = self.trace.capacity();
+            self.state.blocks        = jit_cache.translation_table();
             self.state.cov_table     =
                 corpus.coverage_table.as_ptr() as usize;
-                    
-            let jit_cache = self.jit_cache.as_ref().unwrap();
 
-            let it = rdtsc();
-            'quick_reenter: loop {
-                unsafe {
-                    // Create a function pointer to the JIT
-                    let func =
-                        *(&jit_addr as *const usize as
-                          *const fn(&mut GuestState));
-                    func(&mut self.state);
+            unsafe {
+                // Create a function pointer to the JIT
+                let func =
+                    *(&jit_addr as *const usize as
+                      *const fn(&mut GuestState));
 
-                    // Quickly check if this is an indirect branch
-                    if self.state.exit_reason == ExitReason::IndirectBranch {
-                        // Check if we already know the JIT address of the
-                        // branch target
-                        if let Some(ent) =
-                                jit_cache.lookup(
-                                    VirtAddr(self.state.reenter_pc as usize)) {
-                            jit_addr = ent;
-                            continue 'quick_reenter;
-                        }
-                    }
-
-                    // Either it was not an indirect branch, or we need to lift
-                    // the target
-                    break 'quick_reenter;
-                }
+                // Invoke the JIT
+                let it = rdtsc();
+                func(&mut self.state);
+                *vm_cycles += rdtsc() - it;
             }
-            *vm_cycles += rdtsc() - it;
 
             // Update instructions executed from JIT state
             *instrs_execed = self.state.instrs_execed;
@@ -1562,7 +1559,7 @@ impl Emulator {
     /// Compile a JIT function for `pc` until all paths lead to indirect
     /// jumps or calls
     pub fn compile_jit(&mut self, pc: VirtAddr, corpus: &Corpus)
-            -> Result<Vec<u8>, VmExit> {
+            -> Result<(Vec<u8>, BTreeMap<VirtAddr, usize>), VmExit> {
         let mut visited = BTreeSet::new();
         let mut queued = VecDeque::new();
         
@@ -1570,62 +1567,6 @@ impl Emulator {
         queued.push_back(pc);
 
         let mut program = String::new();
-        program += 
-&format!(r#"
-#include <stddef.h>
-#include <stdint.h>
-
-enum _vmexit {{
-    None,
-    IndirectBranch,
-    ReadFault,
-    WriteFault,
-    Ecall,
-    Ebreak,
-    Timeout,
-    Breakpoint,
-    InvalidOpcode,
-    Coverage,
-    CmpCoverage,
-    CallStackFull,
-}};
-
-struct _state {{
-    enum _vmexit exit_reason;
-    uint64_t     reenter_pc;
-
-    uint64_t cov_from;
-    uint64_t cov_to;
-
-    uint64_t regs[33];
-    uint8_t *__restrict const memory;
-    uint8_t *__restrict const permissions;
-    uintptr_t *__restrict const dirty;
-    size_t dirty_idx;
-    uint64_t *__restrict const dirty_bitmap;
-
-    uint64_t *__restrict const trace_buffer;
-    size_t trace_idx;
-    const size_t trace_len;
-    uint64_t (*const cov_table)[2];
-    uint64_t instrs_execed;
-    const uint64_t timeout;
-
-    uint64_t call_stack[{MAX_CALL_STACK}];
-    uint64_t call_stack_ents;
-    uint64_t call_stack_hash;
-
-    uint64_t path_hash;
-}};
-
-static uint64_t rotl64 (uint64_t x, uint64_t n);
-static uint64_t rotr64 (uint64_t x, uint64_t n);
-    
-const uint64_t PRIME64_2 = 0xC2B2AE3D27D4EB4FULL;
-const uint64_t PRIME64_3 = 0x165667B19E3779F9ULL;
-
-extern "C" void start(struct _state *__restrict state) {{
-"#, MAX_CALL_STACK = MAX_CALL_STACK);
 
         macro_rules! set_reg {
             ($reg:expr, $expr:expr) => {
@@ -1686,10 +1627,38 @@ extern "C" void start(struct _state *__restrict state) {{
                     coverage_event!("CmpCoverage",
                         format!(
                             "{:#x}ULL ^ (state->call_stack_hash & 0xff) ^ \
-                             (state->path_hash & 0xff)", pc.0), "res");
+                             (state->path_hash & 0xff)", pc.0), "res", true);
                 }
             }
         }
+
+        macro_rules! indirect_branch {
+            ($target:expr) => {
+                program += &format!(r#"
+    {{
+        // Look up the JIT address for the target PC
+        auto indir_target_addr = state->blocks[{target} / 4];
+        if(indir_target_addr > 0) {{
+            // We know where to branch, just jump to it directly
+            void (*indir_target)(struct _state *__restrict state) =
+                (void (*)(struct _state *__restrict state))indir_target_addr;
+            return indir_target(state);
+        }} else {{
+            state->exit_reason = IndirectBranch;
+            state->reenter_pc = {target};
+            return;
+        }}
+    }}
+"#, target = $target);
+            }
+        }
+
+        // C++ function declarations
+        let mut decls = String::new();
+
+        // Translates a guest virtual address into the offset of the JIT
+        // buffer. This tells you where to enter the JIT for certain functions
+        let mut inst_offsets = BTreeMap::new();
 
         while let Some(pc) = queued.pop_front() {
             // Attempt to notify of a coverage edge ($from, $to)
@@ -1697,68 +1666,26 @@ extern "C" void start(struct _state *__restrict state) {{
             // if the coverage is new. Thus, it is critical that no side
             // effects occur prior to the coverage_event!() macro use.
             macro_rules! coverage_event {
-                ($cov_source:expr, $from:expr, $to:expr) => {
-                    program += &format!(
+                ($cov_source:expr, $from:expr, $to:expr, $indirect:expr) => {
+                    if CODE_COVERAGE {
+                        program += &format!(
 r#"{{
+    static int moose = 0;
+
+    /*
     // Check for timeout
     if(state->instrs_execed > state->timeout) {{
         state->exit_reason = Timeout;
         state->reenter_pc  = {pc:#x}ULL;
         return;
+    }}*/
+
+    if({indirect} || !moose) {{
+        moose = 1;
+        report_coverage(state, {from}, {to}, {pc});
     }}
-
-    // Update the path hash
-    state->path_hash =
-        rotl64(state->path_hash, 7) ^ ({to});
- 
-    // Compute the hash
-    uint64_t hash = {from};
-    hash ^= hash >> 33;
-    hash *= PRIME64_2;
-    hash += {to};
-    hash ^= hash >> 29;
-    hash *= PRIME64_3;
-    hash ^= hash >> 32;
-
-    auto ct = state->cov_table;
-
-    for( ; ; ) {{
-        // Bounds the hash to the table
-        hash %= {cov_table_len}ULL;
-
-        if(ct[hash][0] == {EMPTY}ULL && __sync_val_compare_and_swap(&ct[hash][0], {EMPTY}ULL,
-                {PENDING}ULL) == {EMPTY}ULL) {{
-            // We own the entry, fill it in
-            __atomic_store_n(&ct[hash][1], {to},   __ATOMIC_SEQ_CST);
-            __atomic_store_n(&ct[hash][0], {from}, __ATOMIC_SEQ_CST);
-
-            state->exit_reason = {cov_source};
-            state->cov_from    = {from};
-            state->cov_to      = {to};
-            state->reenter_pc  = {pc:#x}ULL;
-            return;
-        }} else {{
-            // We lost the race
-
-            // Wait for the entry to be filled in
-            while(__atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST) ==
-                {PENDING}ULL) {{}}
-
-            uint64_t a = __atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST);
-            uint64_t b = __atomic_load_n(&ct[hash][1], __ATOMIC_SEQ_CST);
-            if(a == ({from}) && b == ({to})) {{
-                // Coverage already recorded
-                break;
-            }}
-
-            // Go to the next
-            hash += 1;
-        }}
-    }}
-}}"#, cov_source = $cov_source, from = $from, to = $to, pc = pc.0,
-    cov_table_len = corpus.coverage_table.len(),
-    EMPTY = COVERAGE_ENTRY_EMPTY,
-    PENDING = COVERAGE_ENTRY_PENDING);
+}}"#, from = $from, to = $to, pc = pc.0, indirect=$indirect);
+                    }
                 }
             }
 
@@ -1777,8 +1704,14 @@ r#"{{
             let inst: u32 = self.memory.read_perms(pc, Perm(PERM_EXEC))
                 .map_err(|x| VmExit::ExecFault(x.is_crash().unwrap().1))?;
 
-            // Create the instruction start label
-            program += &format!("inst_{:016x}: {{\n", pc.0);
+            // Create the instruction function
+            program += &format!("extern \"C\" void inst_{:016x}(\
+                       struct _state *__restrict state) {{\n", pc.0);
+            decls += &format!("extern \"C\" void inst_{:016x}(\
+                struct _state *__restrict state);\n", pc.0);
+
+            // Create an unresolved instruction offset
+            inst_offsets.insert(pc, !0);
 
             // Update instructions executed stats
             program += "    state->instrs_execed += 1;\n";
@@ -1831,9 +1764,9 @@ r#"{{
                     // Record coverage
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target));
+                        format!("{:#x}ULL", target), false);
 
-                    if inst.rd == Register::Ra {
+                    if USE_CALL_STACK && inst.rd == Register::Ra {
                         program += &format!(r#"
     if(state->call_stack_ents >= {MAX_CALL_STACK}) {{
         state->exit_reason = CallStackFull;
@@ -1852,18 +1785,14 @@ r#"{{
 
                     if inst.rd == Register::Zero {
                         // Unconditional branch == jal with an rd = zero
-                        program += &format!("goto inst_{:016x};\n", target);
+                        program += &format!("return inst_{:016x}(state);\n",
+                            target);
                         queued.push_back(VirtAddr(target));
                     } else {
                         // Function call, treat as an indirect branch to
                         // avoid inlining boatloads of function calls into
                         // their parents.
-                        program +=
-                            "    state->exit_reason = IndirectBranch;\n";
-                        program +=
-                            &format!("    state->reenter_pc = {:#x}ULL;\n",
-                                target);
-                        program += "    return;\n";
+                        indirect_branch!(format!("{:#x}ULL", target));
                     }
 
                     program += "}\n";
@@ -1881,30 +1810,28 @@ r#"{{
                             program += &format!("    target += {:#x}ULL;\n",
                                 inst.imm as i64 as u64);
 
-                            program += &format!(r#"
-    if(state->call_stack_ents > 0) {{
-        auto cse = state->call_stack_ents - 1;
-        if(target == state->call_stack[cse]) {{
-            state->call_stack_hash =
-                rotr64(state->call_stack_hash ^ target, 7);
-            state->call_stack_ents -= 1;
+                            if USE_CALL_STACK {
+                                program += &format!(r#"
+        if(state->call_stack_ents > 0) {{
+            auto cse = state->call_stack_ents - 1;
+            if(target == state->call_stack[cse]) {{
+                state->call_stack_hash =
+                    rotr64(state->call_stack_hash ^ target, 7);
+                state->call_stack_ents -= 1;
+            }}
         }}
-    }}
-        "#);
+            "#);
+                            }
 
                             // Record coverage
                             coverage_event!("Coverage",
                                 format!("{:#x}ULL", pc.0),
-                                "target");
+                                "target", true);
 
                             // Set the return address
                             set_reg!(inst.rd, retaddr);
 
-                            program +=
-                                "    state->exit_reason = IndirectBranch;\n";
-                            program +=
-                                "    state->reenter_pc = target;\n";
-                            program += "    return;\n";
+                            indirect_branch!("target");
                             program += "}\n";
                             continue;
                         }
@@ -1940,16 +1867,17 @@ r#"{{
                     // Record coverage for true condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target));
+                        format!("{:#x}ULL", target), false);
 
                     program +=
-                        &format!("        goto inst_{:016x};\n", target);
+                        &format!("        return inst_{:016x}(state);\n",
+                            target);
                     program += "    }\n";
                     
                     // Record coverage for false condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", pc.0.wrapping_add(4)));
+                        format!("{:#x}ULL", pc.0.wrapping_add(4)), false);
 
                     // Queue exploration of this target
                     queued.push_back(VirtAddr(target));
@@ -1982,6 +1910,7 @@ r#"{{
                     program += &format!("    addr += {:#x}ULL;\n",
                         inst.imm as i64 as u64);
 
+                    /*
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
     if(addr > {}ULL - sizeof({}) ||
@@ -2003,7 +1932,7 @@ r#"{{
         state->dirty_bitmap[idx] |= bit;
     }}
     "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0,
-    loadtyp, loadtyp, access_mask, DIRTY_BLOCK_SIZE);
+    loadtyp, loadtyp, access_mask, DIRTY_BLOCK_SIZE);*/
 
                     set_reg!(inst.rd, format!("*({}*)(state->memory + addr)",
                         loadtyp));
@@ -2037,6 +1966,7 @@ r#"{{
                     
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
+                    /*
     if(addr > {}ULL - sizeof({}) ||
             (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
         state->exit_reason = WriteFault;
@@ -2047,7 +1977,7 @@ r#"{{
     // Enable reads for memory with RAW set
     auto perms = *({}*)(state->permissions + addr);
     perms &= {:#x}ULL;
-    *({}*)(state->permissions + addr) |= perms >> 3;
+    *({}*)(state->permissions + addr) |= perms >> 3;*/
 
     auto block = addr / {};
     auto idx   = block / 64;
@@ -2359,29 +2289,134 @@ r#"{{
             }
 
             let next_inst = pc.0.wrapping_add(4);
+            program += &format!("    return inst_{:016x}(state);\n", next_inst);
             program += "}\n";
-            program += &format!("    goto inst_{:016x};\n", next_inst);
             queued.push_back(VirtAddr(next_inst));
         }
 
-        // Close the function scope
-        program += "}\n";
+        program = 
+format!(r#"
+#include <stddef.h>
+#include <stdint.h>
 
-        // Add functions we use
-        program += r#"
-static uint64_t rotl64 (uint64_t x, uint64_t n) {
+enum _vmexit {{
+    None,
+    IndirectBranch,
+    ReadFault,
+    WriteFault,
+    Ecall,
+    Ebreak,
+    Timeout,
+    Breakpoint,
+    InvalidOpcode,
+    Coverage,
+    CmpCoverage,
+    CallStackFull,
+}};
+
+struct _state {{
+    enum _vmexit exit_reason;
+    uint64_t     reenter_pc;
+
+    uint64_t cov_from;
+    uint64_t cov_to;
+
+    uint64_t regs[33];
+    uint8_t *__restrict const memory;
+    uint8_t *__restrict const permissions;
+    uintptr_t *__restrict const dirty;
+    size_t dirty_idx;
+    uint64_t *__restrict const dirty_bitmap;
+
+    uint64_t *__restrict const trace_buffer;
+    size_t trace_idx;
+    const size_t trace_len;
+    uint64_t (*const cov_table)[2];
+    uint64_t instrs_execed;
+    const uint64_t timeout;
+
+    uint64_t call_stack[{MAX_CALL_STACK}];
+    uint64_t call_stack_ents;
+    uint64_t call_stack_hash;
+
+    uint64_t path_hash;
+
+    size_t *const blocks;
+}};
+    
+const uint64_t PRIME64_2 = 0xC2B2AE3D27D4EB4FULL;
+const uint64_t PRIME64_3 = 0x165667B19E3779F9ULL;
+
+static uint64_t rotl64 (uint64_t x, uint64_t n) {{
   n &= 0x3f;
   if(!n) return x;
   return (x<<n) | (x>>(0x40-n));
-}
+}}
 
-static uint64_t rotr64 (uint64_t x, uint64_t n) {
+static uint64_t rotr64 (uint64_t x, uint64_t n) {{
   n &= 0x3f;
   if(!n) return x;
   return (x>>n) | (x<<(0x40-n));
-}
-"#;
-        
+}}
+
+__attribute__((noinline))
+static void report_coverage(struct _state *__restrict state, 
+        uint64_t from, uint64_t to, uint64_t pc) {{
+    // Update the path hash
+    state->path_hash =
+        rotl64(state->path_hash, 7) ^ (to);
+ 
+    // Compute the hash
+    uint64_t hash = from;
+    hash ^= hash >> 33;
+    hash *= PRIME64_2;
+    hash += to;
+    hash ^= hash >> 29;
+    hash *= PRIME64_3;
+    hash ^= hash >> 32;
+
+    auto ct = state->cov_table;
+
+    for( ; ; ) {{
+        // Bounds the hash to the table
+        hash %= {cov_table_len}ULL;
+
+        if(ct[hash][0] == {EMPTY}ULL &&
+                __sync_val_compare_and_swap(&ct[hash][0], {EMPTY}ULL,
+                {PENDING}ULL) == {EMPTY}ULL) {{
+            // We own the entry, fill it in
+            __atomic_store_n(&ct[hash][1], to,   __ATOMIC_SEQ_CST);
+            __atomic_store_n(&ct[hash][0], from, __ATOMIC_SEQ_CST);
+
+            state->exit_reason = Coverage;
+            state->cov_from    = from;
+            state->cov_to      = to;
+            state->reenter_pc  = pc;
+            return;
+        }} else {{
+            // We lost the race
+
+            // Wait for the entry to be filled in
+            while(__atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST) ==
+                {PENDING}ULL) {{}}
+
+            uint64_t a = __atomic_load_n(&ct[hash][0], __ATOMIC_SEQ_CST);
+            uint64_t b = __atomic_load_n(&ct[hash][1], __ATOMIC_SEQ_CST);
+            if(a == (from) && b == (to)) {{
+                // Coverage already recorded
+                break;
+            }}
+
+            // Go to the next
+            hash += 1;
+        }}
+    }}
+}}
+"#, MAX_CALL_STACK = MAX_CALL_STACK,
+    cov_table_len = corpus.coverage_table.len(),
+    EMPTY = COVERAGE_ENTRY_EMPTY,
+    PENDING = COVERAGE_ENTRY_PENDING) + &decls + "\n" + &program;
+
         // Hash the C++ file contents
         let proghash = corpus.hasher.hash(program.as_bytes());
 
@@ -2409,11 +2444,37 @@ static uint64_t rotr64 (uint64_t x, uint64_t n) {
 
         // If the cache exists, read the cache
         if cachename.exists() {
-            return Ok(std::fs::read(&cachename)
-                .expect("Failed to read file from jit cache"));
+            // Read the cache
+            let cache = std::fs::read(&cachename).unwrap();
+            let mut _ptr = &cache[..];
+
+            macro_rules! consume {
+                ($ty:ty) => {{
+                    const SOT: usize = core::mem::size_of::<$ty>();
+                    let mut buf = [0u8; SOT];
+                    buf.copy_from_slice(&_ptr[..SOT]);
+                    _ptr = &_ptr[SOT..];
+                    <$ty>::from_ne_bytes(buf)
+                }}
+            }
+
+            // Clear the existing instr offsets
+            inst_offsets.clear();
+
+            // Deserialize the metadata
+            let entries = consume!(u64);
+            for _ in 0..entries {
+                let gvaddr = VirtAddr(consume!(u64).try_into().unwrap());
+                let offset: usize = consume!(u64).try_into().unwrap();
+                inst_offsets.insert(gvaddr, offset);
+            }
+
+            // Return out the cached info
+            return Ok((_ptr.into(), inst_offsets));
         }
         
-        print!("Compiling cache for {:#018x} -> {:032x}\n", pc.0, proghash);
+        print!("Compiling cache for {:#018x} -> {:032x} {}\n",
+               pc.0, proghash, inst_offsets.len());
 
         let cppfn = std::env::temp_dir().join(
             format!("fwetmp_{:?}.cpp",
@@ -2424,7 +2485,7 @@ static uint64_t rotr64 (uint64_t x, uint64_t n) {
         let binfn = std::env::temp_dir().join(
             format!("fwetmp_{:?}.bin",
                     std::thread::current().id()));
-
+        
         // Write out the test program
         std::fs::write(&cppfn, program)
             .expect("Failed to write program");
@@ -2436,10 +2497,11 @@ static uint64_t rotr64 (uint64_t x, uint64_t n) {
             "-Wno-unused-label",
             "-Wno-unused-variable",
             "-Wno-unused-function",
+            "-Wno-infinite-recursion",
             "-Werror",
             "-fno-strict-aliasing",
             "-static", "-nostdlib", "-ffreestanding",
-            "-Wl,-Tldscript.ld", "-Wl,--gc-sections", "-Wl,--build-id=none",
+            "-Wl,-Tldscript.ld", "-Wl,--build-id=none",
             "-o", linkfn.to_str().unwrap(),
             cppfn.to_str().unwrap()]).status()
             .expect("Failed to launch clang++");
@@ -2447,17 +2509,58 @@ static uint64_t rotr64 (uint64_t x, uint64_t n) {
 
         // Convert the ELF to a binary
         let res = Command::new("objcopy")
-            .args(&["-O", "binary", "--remove-section=.note.gnu.property",
+            .args(&["-O", "binary",
+                    "--set-section-flags", ".bss=contents,alloc,load",
                     linkfn.to_str().unwrap(),
                     binfn.to_str().unwrap()]).status()
             .expect("Failed to launch objcopy");
         assert!(res.success(), "objcopy returned error");
 
-        // Move the compiled output to the cache
-        std::fs::rename(&binfn, &cachename)
+        // Get the `nm` output indicating where function entries are
+        let res = Command::new("nm")
+            .arg(linkfn.to_str().unwrap())
+            .output().unwrap();
+        assert!(res.status.success(), "nm returned error");
+        let stdout = std::str::from_utf8(&res.stdout).unwrap();
+        let mut nm_func_to_addr = BTreeMap::new();
+        for line in stdout.lines() {
+            let mut spl = line.split(" T inst_");
+            if spl.clone().count() != 2 { continue; }
+
+            // Parse the JIT address and turn it into an offset
+            let jit_addr =
+                usize::from_str_radix(spl.next().unwrap(), 16).unwrap() -
+                0x10000;
+
+            // Insert the address to the function in our database
+            nm_func_to_addr.insert(spl.next().unwrap(), jit_addr);
+        }
+
+        // Now, resolve the addresses
+        for (gvaddr, res) in inst_offsets.iter_mut() {
+            if let Some(&addr) =
+                    nm_func_to_addr.get(format!("{:016x}", gvaddr.0).as_str()){
+                *res = addr;
+            } else {
+                panic!("Could not resolve compiled function to jit addr?");
+            }
+        }
+
+        // Create the JIT binary file with the metadata of the sections
+        let mut jit = Vec::new();
+        jit.extend_from_slice(&(inst_offsets.len() as u64).to_ne_bytes());
+        for (&gvaddr, &res) in inst_offsets.iter() {
+            jit.extend_from_slice(&(gvaddr.0 as u64).to_ne_bytes());
+            jit.extend_from_slice(&(res      as u64).to_ne_bytes());
+        }
+        let jitbytes = std::fs::read(&binfn).unwrap();
+        jit.extend_from_slice(&jitbytes);
+
+        // Write the JIT + metadata to the cache
+        std::fs::write(&cachename, jit)
             .expect("Failed to rename compiled JIT to cache file");
 
-        Ok(std::fs::read(&cachename).expect("Failed to read JIT code"))
+        Ok((jitbytes, inst_offsets))
     }
 }
 

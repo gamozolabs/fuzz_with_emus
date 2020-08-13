@@ -101,6 +101,7 @@ impl JitCache {
     }
 
     /// Get the address of the JIT block translation table
+    #[inline]
     pub fn translation_table(&self) -> usize {
         self.blocks.as_ptr() as usize
     }
@@ -126,20 +127,20 @@ impl JitCache {
         }
     }
 
-    /// Update the JIT for a given virtual address, returns the JIT address
-    /// of the new (or existing) JIT corresponding to `addr`
-    pub fn add_mapping(&self, addr: VirtAddr, code: &[u8]) -> usize {
-        // Make sure the address is aligned
-        assert!(addr.0 & 3 == 0, "Unaligned code address to JIT lookup");
-
+    /// Add a JIT to the JIT cache, the `code` are the raw bytes of the
+    /// compiled JIT and the `BTreeMap` converts guest addresses into JIT
+    /// addresses
+    pub fn add_mappings(&self, addr: VirtAddr, code: &[u8],
+                        mappings: &BTreeMap<VirtAddr, usize>) -> usize {
         // Get exclusive access to the JIT
         let mut jit = self.jit.lock().unwrap();
 
-        // Now that we have the lock, check if there's already an existing
-        // mapping. If there is not, there is no way one could show up while
-        // we have the lock held, thus we can safely continue from this point.
-        if let Some(existing) = self.lookup(addr) {
-            return existing;
+        // Determine if any of the guest addresses are new to the JIT, if even
+        // one is, then we have to insert the JIT into the cache
+        let has_new = mappings.keys().any(|&x| self.lookup(x).is_none());
+        if !has_new {
+            // We have nothing new, just give the JIT address `addr`
+            return self.lookup(addr).unwrap();
         }
 
         // Check if we already have identical code
@@ -172,10 +173,12 @@ impl JitCache {
         };
 
         // Update the JIT lookup address
-        self.blocks[addr.0 / 4].store(new_addr, Ordering::SeqCst);
+        for (addr, offset) in mappings {
+            self.blocks[addr.0 / 4].store(new_addr + offset, Ordering::SeqCst);
+        }
 
         // Return the newly allocated JIT
-        new_addr
+        self.lookup(addr).unwrap()
     }
 }
 
