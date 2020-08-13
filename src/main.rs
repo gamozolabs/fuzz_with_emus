@@ -1085,7 +1085,7 @@ fn main() -> io::Result<()> {
     let num_cores = if REPRO_MODE.is_some() {
         1
     } else {
-        192
+        1
     };
 
     for thr_id in 0..num_cores {
