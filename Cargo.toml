@@ -12,3 +12,7 @@ falkhash = { path = "shared/falkhash" }
 aht = { path = "shared/aht" }
 atomicvec = { path = "shared/atomicvec" }
 basic_mutator = { path = "../mutator" }
+
+[profile.release]
+overflow-checks=true
+

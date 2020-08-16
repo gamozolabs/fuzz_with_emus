@@ -25,7 +25,7 @@ const CODE_COVERAGE: bool = true;
 const COMPARE_COVERAGE: bool = false;
 
 /// If `true` the call stack will be maintained for the emulated code
-const USE_CALL_STACK: bool = false;
+const USE_CALL_STACK: bool = true;
 
 /// If set, all register state will be saved before the execution of every
 /// instruction.
@@ -97,6 +97,9 @@ struct GuestState {
     path_hash: u64,
 
     blocks: usize,
+    blocks_len: usize,
+
+    revision: u64,
 }
 
 impl Default for GuestState {
@@ -126,6 +129,8 @@ impl Default for GuestState {
             path_hash: 0,
 
             blocks: 0,
+            blocks_len: 0,
+            revision: 0,
         }
     }
 }
@@ -734,6 +739,9 @@ impl Emulator {
 
         // Update some stats
         self.resets += 1;
+
+        // Update revision
+        self.state.revision += 1;
     }
 
     /// Allocate a new file descriptor
@@ -801,6 +809,13 @@ impl Emulator {
                         corpus.coverage_log.lock().unwrap();
                     write!(cl, "{}\n", new_cov).unwrap();
                 }
+                
+                {
+                    let mut cl =
+                        corpus.lighthouse_log.lock().unwrap();
+                    write!(cl, "{:#x}\n", from).unwrap();
+                    write!(cl, "{:#x}\n", to).unwrap();
+                }
 
                 // Indicate that this case caused new coverage
                 self.new_coverage = Some(self.state.instrs_execed);
@@ -815,7 +830,6 @@ impl Emulator {
 
     /// Register that new compare coverage has occurred
     fn notify_compare_coverage(&mut self, _corpus: &Corpus) {
-        /*
         let key = (
             CoverageType::Compare,
             self.state.cov_from,
@@ -825,7 +839,7 @@ impl Emulator {
         );
 
         // Update code coverage
-        corpus.coverage.entry_or_insert(
+        _corpus.coverage.entry_or_insert(
             &key, self.state.cov_from as usize, || {
                 // Indicate that this case caused new coverage
                 self.new_coverage = Some(self.state.instrs_execed);
@@ -835,7 +849,7 @@ impl Emulator {
                 self.state.timeout += 1_000_000;
 
                 Box::new(())
-            });*/
+            });
     }
 
     /// Run the VM using the emulator
@@ -876,10 +890,10 @@ impl Emulator {
                     // Compute the hash
                     let mut hash: u64 = $from;
                     hash ^= hash >> 33;
-                    hash *= PRIME64_2;
-                    hash += $to;
+                    hash = hash.wrapping_mul(PRIME64_2);
+                    hash = hash.wrapping_add($to);
                     hash ^= hash >> 29;
-                    hash *= PRIME64_3;
+                    hash = hash.wrapping_mul(PRIME64_3);
                     hash ^= hash >> 32;
                     
                     // Convert the hash to a `usize`
@@ -927,8 +941,8 @@ impl Emulator {
                         let tmp = (tmp >> 4) & tmp;
                         let tmp = tmp & 0x0101010101010101;
                         let hash =
-                            pc ^ (self.state.call_stack_hash & 0xff) ^
-                            self.state.path_hash & 0xff;
+                            pc ^ (self.state.call_stack_hash & 0xf) ^
+                            self.state.path_hash & 0xf;
 
                         // Register the coverage as compare coverage for this
                         // PC with the bitmask we identified
@@ -1294,6 +1308,71 @@ impl Emulator {
                             // AND
                             self.set_reg(inst.rd, rs1 & rs2);
                         }
+                        (0b0000001, 0b000) => {
+                            // MUL
+                            self.set_reg(inst.rd, rs1.wrapping_mul(rs2));
+                        }
+                        (0b0000001, 0b001) => {
+                            // MULH
+                            let rs1 = rs1 as i64 as u128;
+                            let rs2 = rs2 as i64 as u128;
+                            let val = rs1.wrapping_mul(rs2);
+                            self.set_reg(inst.rd, (val >> 64) as u64);
+                        }
+                        (0b0000001, 0b010) => {
+                            // MULHSU
+                            let rs1 = rs1 as i64 as u128;
+                            let rs2 = rs2 as u64 as u128;
+                            let val = rs1.wrapping_mul(rs2);
+                            self.set_reg(inst.rd, (val >> 64) as u64);
+                        }
+                        (0b0000001, 0b011) => {
+                            // MULHU
+                            let rs1 = rs1 as u64 as u128;
+                            let rs2 = rs2 as u64 as u128;
+                            let val = rs1.wrapping_mul(rs2);
+                            self.set_reg(inst.rd, (val >> 64) as u64);
+                        }
+                        (0b0000001, 0b100) => {
+                            // DIV
+                            let rs1 = rs1 as i64;
+                            let rs2 = rs2 as i64;
+                            let val = if rs2 == 0 {
+                                -1
+                            } else {
+                                rs1.wrapping_div(rs2)
+                            };
+                            self.set_reg(inst.rd, val as u64);
+                        }
+                        (0b0000001, 0b101) => {
+                            // DIVU
+                            let val = if rs2 == 0 {
+                                core::u64::MAX
+                            } else {
+                                rs1.wrapping_div(rs2)
+                            };
+                            self.set_reg(inst.rd, val);
+                        }
+                        (0b0000001, 0b110) => {
+                            // REM
+                            let rs1 = rs1 as i64;
+                            let rs2 = rs2 as i64;
+                            let val = if rs2 == 0 {
+                                rs1
+                            } else {
+                                rs1.wrapping_rem(rs2)
+                            };
+                            self.set_reg(inst.rd, val as u64);
+                        }
+                        (0b0000001, 0b111) => {
+                            // REMU
+                            let val = if rs2 == 0 {
+                                rs1
+                            } else {
+                                rs1.wrapping_rem(rs2)
+                            };
+                            self.set_reg(inst.rd, val);
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1332,6 +1411,56 @@ impl Emulator {
                             let shamt = rs2 & 0b11111;
                             self.set_reg(inst.rd,
                                 ((rs1 as i32) >> shamt) as i64 as u64);
+                        }
+                        (0b0000001, 0b000) => {
+                            // MULW
+                            self.set_reg(inst.rd,
+                                (rs1 as u32).wrapping_mul(rs2 as u32)
+                                as i32 as u64);
+                        }
+                        (0b0000001, 0b100) => {
+                            // DIVW
+                            let rs1 = rs1 as i32;
+                            let rs2 = rs2 as i32;
+                            let val = if rs2 == 0 {
+                                -1
+                            } else {
+                                rs1.wrapping_div(rs2)
+                            };
+                            self.set_reg(inst.rd, val as i32 as u64);
+                        }
+                        (0b0000001, 0b101) => {
+                            // DIVUW
+                            let rs1 = rs1 as u32;
+                            let rs2 = rs2 as u32;
+                            let val = if rs2 == 0 {
+                                core::u32::MAX
+                            } else {
+                                rs1.wrapping_div(rs2)
+                            };
+                            self.set_reg(inst.rd, val as i32 as u64);
+                        }
+                        (0b0000001, 0b110) => {
+                            // REMW
+                            let rs1 = rs1 as i32;
+                            let rs2 = rs2 as i32;
+                            let val = if rs2 == 0 {
+                                rs1
+                            } else {
+                                rs1.wrapping_rem(rs2)
+                            };
+                            self.set_reg(inst.rd, val as i32 as u64);
+                        }
+                        (0b0000001, 0b111) => {
+                            // REMUW
+                            let rs1 = rs1 as u32;
+                            let rs2 = rs2 as u32;
+                            let val = if rs2 == 0 {
+                                rs1
+                            } else {
+                                rs1.wrapping_rem(rs2)
+                            };
+                            self.set_reg(inst.rd, val as i32 as u64);
                         }
                         _ => unreachable!(),
                     }
@@ -1420,33 +1549,24 @@ impl Emulator {
         // Get the JIT addresses
         let (memory, perms, dirty, dirty_bitmap) = self.memory.jit_addrs();
 
-        // If `Some`, we re-entry the JIT by jumping directly to this address,
-        // ignoring PC
-        let mut override_jit_addr = None;
-
         loop {
-            let jit_addr = if let Some(override_jit_addr) =
-                    override_jit_addr.take() {
-                override_jit_addr
+            // Get the current PC
+            let pc = self.reg(Register::Pc);
+            let jit_addr = {
+                let jit_cache = self.jit_cache.as_ref().unwrap();
+                jit_cache.lookup(VirtAddr(pc as usize))
+            };
+
+            let jit_addr = if let Some(jit_addr) = jit_addr {
+                jit_addr
             } else {
-                // Get the current PC
-                let pc = self.reg(Register::Pc);
-                let jit_addr = {
-                    let jit_cache = self.jit_cache.as_ref().unwrap();
-                    jit_cache.lookup(VirtAddr(pc as usize))
-                };
+                // Generate the JIT for this PC
+                let (jit, entry_points) =
+                    self.compile_jit(VirtAddr(pc as usize), corpus)?;
 
-                if let Some(jit_addr) = jit_addr {
-                    jit_addr
-                } else {
-                    // Generate the JIT for this PC
-                    let (jit, entry_points) =
-                        self.compile_jit(VirtAddr(pc as usize), corpus)?;
-
-                    // Update the JIT tables
-                    self.jit_cache.as_ref().unwrap().add_mappings(
-                        VirtAddr(pc as usize), &jit, &entry_points)
-                }
+                // Update the JIT tables
+                self.jit_cache.as_ref().unwrap().add_mappings(
+                    VirtAddr(pc as usize), &jit, &entry_points)
             };
 
             // Set up the JIT state
@@ -1461,6 +1581,7 @@ impl Emulator {
             self.state.trace_idx     = self.trace.len();
             self.state.trace_len     = self.trace.capacity();
             self.state.blocks        = jit_cache.translation_table();
+            self.state.blocks_len    = jit_cache.num_blocks();
             self.state.cov_table     =
                 corpus.coverage_table.as_ptr() as usize;
 
@@ -1626,8 +1747,8 @@ impl Emulator {
                     // PC with the bitmask we identified
                     coverage_event!("CmpCoverage",
                         format!(
-                            "{:#x}ULL ^ (state->call_stack_hash & 0xff) ^ \
-                             (state->path_hash & 0xff)", pc.0), "res");
+                            "{:#x}ULL ^ (state->call_stack_hash & 0xf) ^ \
+                             (state->path_hash & 0xf)", pc.0), "res", false);
                 }
             }
         }
@@ -1637,17 +1758,19 @@ impl Emulator {
                 program += &format!(r#"
     {{
         // Look up the JIT address for the target PC
-        auto indir_target_addr = state->blocks[{target} / 4];
-        if(indir_target_addr > 0) {{
-            // We know where to branch, just jump to it directly
-            void (*indir_target)(struct _state *__restrict state) =
-                (void (*)(struct _state *__restrict state))indir_target_addr;
-            return indir_target(state);
-        }} else {{
-            state->exit_reason = IndirectBranch;
-            state->reenter_pc = {target};
-            return;
+        if(({target} / 4) < state->blocks_len) {{
+            auto indir_target_addr = state->blocks[{target} / 4];
+            if(indir_target_addr > 0) {{
+                // We know where to branch, just jump to it directly
+                void (*indir_target)(struct _state *__restrict const state) =
+                    (void (*)(struct _state *__restrict const state))indir_target_addr;
+                return indir_target(state);
+            }}
         }}
+
+        state->exit_reason = IndirectBranch;
+        state->reenter_pc = {target};
+        return;
     }}
 "#, target = $target);
             }
@@ -1666,25 +1789,26 @@ impl Emulator {
             // if the coverage is new. Thus, it is critical that no side
             // effects occur prior to the coverage_event!() macro use.
             macro_rules! coverage_event {
-                ($cov_source:expr, $from:expr, $to:expr) => {
+                ($cov_source:expr, $from:expr, $to:expr, $oneshot:expr) => {
                     if CODE_COVERAGE {
                         program += &format!(
 r#"{{
-    /*
     // Check for timeout
     if(state->instrs_execed > state->timeout) {{
         state->exit_reason = Timeout;
         state->reenter_pc  = {pc:#x}ULL;
         return;
-    }}*/
+    }}
 
-    /*
-    static int reported = 0;
-    if(!reported) {{
+    static char reported = 0;
+    if(!{oneshot} || !reported) {{
         reported = 1;
-        report_coverage(state, {from}, {to}, {pc});
-    }}*/
-}}"#, from = $from, to = $to, pc = pc.0);
+        if(report_coverage(state, {cov_source}, {from}, {to}, {pc})) {{
+            return;
+        }}
+    }}
+}}"#, from = $from, to = $to, pc = pc.0, oneshot = $oneshot,
+    cov_source = $cov_source);
                     }
                 }
             }
@@ -1706,15 +1830,15 @@ r#"{{
 
             // Create the instruction function
             program += &format!("extern \"C\" void inst_{:016x}(\
-                       struct _state *__restrict state) {{\n", pc.0);
+                       struct _state *__restrict const state)  {{\n", pc.0);
             decls += &format!("extern \"C\" void inst_{:016x}(\
-                struct _state *__restrict state);\n", pc.0);
+                struct _state *__restrict const state);\n", pc.0);
 
             // Create an unresolved instruction offset
             inst_offsets.insert(pc, !0);
 
             // Update instructions executed stats
-            program += "    state->instrs_execed += 1;\n";
+            //program += "    state->instrs_execed += 1;\n";
             
             if ENABLE_TRACING {
                 program += &format!(r#"
@@ -1764,7 +1888,7 @@ r#"{{
                     // Record coverage
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target));
+                        format!("{:#x}ULL", target), true);
 
                     if USE_CALL_STACK && inst.rd == Register::Ra {
                         program += &format!(r#"
@@ -1826,7 +1950,7 @@ r#"{{
                             // Record coverage
                             coverage_event!("Coverage",
                                 format!("{:#x}ULL", pc.0),
-                                "target");
+                                "target", false);
 
                             // Set the return address
                             set_reg!(inst.rd, retaddr);
@@ -1867,7 +1991,7 @@ r#"{{
                     // Record coverage for true condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", target));
+                        format!("{:#x}ULL", target), true);
 
                     program +=
                         &format!("        return inst_{:016x}(state);\n",
@@ -1877,7 +2001,7 @@ r#"{{
                     // Record coverage for false condition
                     coverage_event!("Coverage",
                         format!("{:#x}ULL", pc.0),
-                        format!("{:#x}ULL", pc.0.wrapping_add(4)));
+                        format!("{:#x}ULL", pc.0.wrapping_add(4)), true);
 
                     // Queue exploration of this target
                     queued.push_back(VirtAddr(target));
@@ -1910,7 +2034,6 @@ r#"{{
                     program += &format!("    addr += {:#x}ULL;\n",
                         inst.imm as i64 as u64);
 
-                    /*
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
     if(addr > {}ULL - sizeof({}) ||
@@ -1920,6 +2043,7 @@ r#"{{
         return;
     }}
     
+    /*
     // Set the accessed bits
     auto perms = *({}*)(state->permissions + addr);
     *({}*)(state->permissions + addr) |= {:#x}ULL;
@@ -1930,9 +2054,9 @@ r#"{{
     if((state->dirty_bitmap[idx] & bit) == 0) {{
         state->dirty[state->dirty_idx++] = block;
         state->dirty_bitmap[idx] |= bit;
-    }}
+    }}*/
     "#, self.memory.len(), loadtyp, loadtyp, perm_mask, perm_mask, pc.0,
-    loadtyp, loadtyp, access_mask, DIRTY_BLOCK_SIZE);*/
+    loadtyp, loadtyp, access_mask, DIRTY_BLOCK_SIZE);
 
                     set_reg!(inst.rd, format!("*({}*)(state->memory + addr)",
                         loadtyp));
@@ -1966,7 +2090,6 @@ r#"{{
                     
                     // Check the bounds and permissions of the address
                     program += &format!(r#"
-                    /*
     if(addr > {}ULL - sizeof({}) ||
             (*({}*)(state->permissions + addr) & {:#x}ULL) != {:#x}ULL) {{
         state->exit_reason = WriteFault;
@@ -1977,7 +2100,7 @@ r#"{{
     // Enable reads for memory with RAW set
     auto perms = *({}*)(state->permissions + addr);
     perms &= {:#x}ULL;
-    *({}*)(state->permissions + addr) |= perms >> 3;*/
+    *({}*)(state->permissions + addr) |= perms >> 3;
 
     auto block = addr / {};
     auto idx   = block / 64;
@@ -2162,6 +2285,67 @@ r#"{{
                             get_reg!("auto rs2", inst.rs2);
                             set_reg!(inst.rd, "rs1 & rs2");
                         }
+                        (0b0000001, 0b000) => {
+                            // MUL
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs1 * rs2");
+                        }
+                        (0b0000001, 0b001) => {
+                            // MULH
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "((uint128_t)(int64_t)rs1 * \
+                                  (uint128_t)(int64_t)rs2) >> 64");
+                        }
+                        (0b0000001, 0b010) => {
+                            // MULHSU
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "((uint128_t)(int64_t)rs1 * \
+                                  (uint128_t)(uint64_t)rs2) >> 64");
+                        }
+                        (0b0000001, 0b011) => {
+                            // MULHU
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "((uint128_t)(uint64_t)rs1 * \
+                                  (uint128_t)(uint64_t)rs2) >> 64");
+                        }
+                        (0b0000001, 0b100) => {
+                            // DIV
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "rs2 ? (((int64_t)rs1 == INT64_MIN && \
+                                         (int64_t)rs2 == -1) ? \
+                                    INT64_MIN : (int64_t)rs1 / (int64_t)rs2)\
+                                    : -1");
+                        }
+                        (0b0000001, 0b101) => {
+                            // DIVU
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs2 ? rs1 / rs2 : UINT64_MAX")
+                        }
+                        (0b0000001, 0b110) => {
+                            // REM
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd,
+                                "rs2 ? (((int64_t)rs1 == INT64_MIN && \
+                                         (int64_t)rs2 == -1) ? \
+                                    0 : (int64_t)rs1 % (int64_t)rs2) : rs1");
+                        }
+                        (0b0000001, 0b111) => {
+                            // REMU
+                            get_reg!("auto rs1", inst.rs1);
+                            get_reg!("auto rs2", inst.rs2);
+                            set_reg!(inst.rd, "rs2 ? rs1 % rs2 : rs1")
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -2200,6 +2384,43 @@ r#"{{
                             get_regw!("auto rs2", inst.rs2);
                             set_regw!(inst.rd,
                                      "(int32_t)rs1 >> ((int32_t)rs2 & 0x1f)");
+                        }
+                        (0b0000001, 0b000) => {
+                            // MULW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs1 * rs2");
+                        }
+                        (0b0000001, 0b100) => {
+                            // DIVW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd,
+                                "rs2 ? (((int32_t)rs1 == INT32_MIN && \
+                                         (int32_t)rs2 == -1) ? \
+                                    INT32_MIN : (int32_t)rs1 / (int32_t)rs2)\
+                                    : -1");
+                        }
+                        (0b0000001, 0b101) => {
+                            // DIVUW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs2 ? rs1 / rs2 : UINT32_MAX")
+                        }
+                        (0b0000001, 0b110) => {
+                            // REMW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd,
+                                "rs2 ? (((int32_t)rs1 == INT32_MIN && \
+                                         (int32_t)rs2 == -1) ? \
+                                    0 : (int32_t)rs1 % (int32_t)rs2) : rs1");
+                        }
+                        (0b0000001, 0b111) => {
+                            // REMUW
+                            get_regw!("auto rs1", inst.rs1);
+                            get_regw!("auto rs2", inst.rs2);
+                            set_regw!(inst.rd, "rs2 ? rs1 % rs2 : rs1")
                         }
                         _ => unreachable!(),
                     }
@@ -2342,6 +2563,8 @@ struct _state {{
     uint64_t path_hash;
 
     size_t *const blocks;
+    const size_t blocks_len;
+    const size_t revision;
 }};
     
 const uint64_t PRIME64_2 = 0xC2B2AE3D27D4EB4FULL;
@@ -2359,8 +2582,8 @@ static uint64_t rotr64 (uint64_t x, uint64_t n) {{
   return (x>>n) | (x<<(0x40-n));
 }}
 
-__attribute__((noinline))
-static void report_coverage(struct _state *__restrict state, 
+static int report_coverage(struct _state *__restrict const state,
+        enum _vmexit reason,
         uint64_t from, uint64_t to, uint64_t pc) {{
     // Update the path hash
     state->path_hash =
@@ -2388,11 +2611,11 @@ static void report_coverage(struct _state *__restrict state,
             __atomic_store_n(&ct[hash][1], to,   __ATOMIC_SEQ_CST);
             __atomic_store_n(&ct[hash][0], from, __ATOMIC_SEQ_CST);
 
-            state->exit_reason = Coverage;
+            state->exit_reason = reason;
             state->cov_from    = from;
             state->cov_to      = to;
             state->reenter_pc  = pc;
-            return;
+            return 1;
         }} else {{
             // We lost the race
 
@@ -2411,6 +2634,8 @@ static void report_coverage(struct _state *__restrict state,
             hash += 1;
         }}
     }}
+
+    return 0;
 }}
 "#, MAX_CALL_STACK = MAX_CALL_STACK,
     cov_table_len = corpus.coverage_table.len(),
@@ -2492,13 +2717,14 @@ static void report_coverage(struct _state *__restrict state,
 
         // Create the ELF
         let res = Command::new("clang++").args(&[
-            "-O3", "-march=native", "-Wall",
+            "-O3", "-Wall",
             "-fno-asynchronous-unwind-tables",
             "-Wno-unused-label",
             "-Wno-unused-variable",
             "-Wno-unused-function",
             "-Wno-infinite-recursion",
             "-Werror",
+            "-march=native",
             "-fno-strict-aliasing",
             "-static", "-nostdlib", "-ffreestanding",
             "-Wl,-Tldscript.ld", "-Wl,--build-id=none",
@@ -2535,7 +2761,7 @@ static void report_coverage(struct _state *__restrict state,
             // Insert the address to the function in our database
             nm_func_to_addr.insert(spl.next().unwrap(), jit_addr);
         }
-
+         
         // Now, resolve the addresses
         for (gvaddr, res) in inst_offsets.iter_mut() {
             if let Some(&addr) =
@@ -2559,6 +2785,10 @@ static void report_coverage(struct _state *__restrict state,
         // Write the JIT + metadata to the cache
         std::fs::write(&cachename, jit)
             .expect("Failed to rename compiled JIT to cache file");
+        
+        if inst_offsets.len() > 50 {
+            //std::process::exit(0);
+        }
 
         Ok((jitbytes, inst_offsets))
     }

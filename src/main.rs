@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
+use std::convert::TryInto;
 use std::collections::{BTreeMap, BTreeSet};
 use mmu::{VirtAddr, Perm, Section, PERM_READ, PERM_WRITE, PERM_EXEC, PERM_ACC};
 use emulator::{Emulator, Register, VmExit, EmuFile, FaultType, AddressType};
@@ -23,7 +24,7 @@ use basic_mutator::{Mutator, InputDatabase, EmptyDatabase};
 
 /// If set, uses the enclosed string as a filename and uses it as the input
 /// without any corruption
-const REPRO_MODE: Option<&str> = None; //Some("crashes/0x3d670_Read_Normal.crash");
+const REPRO_MODE: Option<&str> = None; //Some("crashes/0x69478_Read_Normal.crash");
 
 /// If set, prints information about all hooked allocations
 const VERBOSE_ALLOCS: bool = false;
@@ -157,6 +158,11 @@ fn handle_syscall(emu: &mut Emulator) -> Result<(), VmExit> {
                 emu.set_reg(Register::A0, !0);
             }
 
+            Ok(())
+        }
+        169 => {
+            // gettimeofday()
+            emu.set_reg(Register::A0, 0);
             Ok(())
         }
         63 => {
@@ -442,7 +448,6 @@ struct Statistics {
 fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
           stats: Arc<Mutex<Statistics>>, corpus: Arc<Corpus>) {
     // Pin to a core
-    print!("{}\n", thr_id);
     affinity::set_affinity(thr_id).unwrap();
 
     // Create a new random number generator
@@ -454,7 +459,7 @@ fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
 
     // Create a mutator
     let mut mutator = Mutator::new().seed(rng.rand() as u64)
-        .max_input_size(16 * 1024);
+        .max_input_size(1024 * 1024);
 
     loop {
         // Start a timer
@@ -476,11 +481,12 @@ fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
             // Number of instructions executed this fuzz case
             let mut run_instrs = 0u64;
 
-            /*
             // Clear the fuzz input
             emu.fuzz_input.clear();
             mutator.input.clear();
             mutator.accessed.clear();
+
+            let mut options: u32 = rng.rand() as u32;
 
             // Pick a random file from the corpus as an input
             if (rng.rand() % 32) != 0 && corpus.inputs.len() > 0 {
@@ -488,7 +494,11 @@ fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
                 let sel = rng.rand() % corpus.inputs.len();
                 if let Some(input) = corpus.inputs.get(sel) {
                     // Copy the input
-                    mutator.input.extend_from_slice(&input.data);
+                    options = u32::from_ne_bytes(
+                        input.data[input.data.len() - 4..]
+                        .try_into().unwrap());
+                    mutator.input.extend_from_slice(
+                        &input.data[..input.data.len() - 4]);
 
                     // Set a timeout which can reach all coverage for this
                     // input
@@ -509,24 +519,39 @@ fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
 
             if mutator.input.len() == 0 {
                 // Just make a blank input
-                mutator.input.resize(128 * 1024, 0u8);
+                mutator.input.resize(1024 * 1024, 0u8);
             }
 
             // Mutate!
-            //mutator.mutate(rng.rand() % 16, &*corpus);
+            mutator.mutate(rng.rand() % 10, &*corpus);
+
+            // 1 in 8 Chance to change options
+            if rng.rand() % 8 == 0 {
+                options = rng.rand() as u32;
+            }
             
-            // If we're in repro mode, use the repro file
-            if let Some(repro_file) = REPRO_MODE {
-                mutator.input.clear();
-                mutator.input.extend_from_slice(&std::fs::read(repro_file)
-                    .expect("Failed to read repro file"));
+            // 1 in 2 Chance of no extra options
+            if rng.rand() % 2 == 0 {
+                options = 0;
             }
 
             emu.fuzz_input.extend_from_slice(&mutator.input);
-            assert!(emu.fuzz_input.len() <= len);
+            assert!(emu.fuzz_input.len() <= len, "{} {}\n",
+                emu.fuzz_input.len(), len);
+
+            emu.fuzz_input.extend_from_slice(&options.to_ne_bytes());
+
+            // If we're in repro mode, use the repro file
+            if let Some(repro_file) = REPRO_MODE {
+                emu.fuzz_input.clear();
+                emu.fuzz_input.extend_from_slice(&std::fs::read(repro_file)
+                    .expect("Failed to read repro file"));
+            }
+
+            // Inject the input
             emu.memory.write_from(VirtAddr(buf as usize), &emu.fuzz_input)
                 .unwrap();
-            emu.set_reg(Register::A1, emu.fuzz_input.len() as u64);*/
+            emu.set_reg(Register::A1, emu.fuzz_input.len() as u64);
 
             let vmexit = loop {
                 let vmexit = emu.run(&mut run_instrs,
@@ -575,9 +600,13 @@ fn worker(thr_id: usize, mut emu: Emulator, original: Arc<Emulator>,
                     let crash_fn = Path::new("crashes").join(
                         format!("{:#x}_{:?}_{:?}.crash",
                                 (key.0).0, key.1, key.2));
+                    let reg_fn = crash_fn.with_extension("regs");
                     print!("New crash {:?}\n", crash_fn);
                     std::fs::write(&crash_fn,
                         &emu.fuzz_input).expect("Failed to write fuzz input");
+                    std::fs::write(&reg_fn,
+                        &format!("{}", emu))
+                        .expect("Failed to write crash register state");
 
                     Box::new(())
                 });
@@ -638,8 +667,9 @@ impl Input {
             }
         }
 
+        /*
         print!("New input {} bytes, {} accessed [{:.4}]\n",
-            data.len(), avec.len(), avec.len() as f64 / data.len() as f64);
+            data.len(), avec.len(), avec.len() as f64 / data.len() as f64);*/
 
         Input {
             instrs,
@@ -679,6 +709,9 @@ pub struct Corpus {
 
     /// Coverage log file
     coverage_log: Mutex<File>,
+    
+    /// Lighthouse coverage log file
+    lighthouse_log: Mutex<File>,
 
     /// Active compile jobs
     compile_jobs: Mutex<BTreeSet<u128>>,
@@ -688,7 +721,7 @@ impl InputDatabase for Corpus {
     fn num_inputs(&self) -> usize { self.inputs.len() }
     fn input(&self, idx: usize) -> Option<&[u8]> {
         self.inputs.get(idx).map(|x| {
-            &x.data[..]
+            &x.data[..x.data.len() - 4]
         })
     }   
 }
@@ -917,6 +950,8 @@ fn main() -> io::Result<()> {
         corpus: AtomicVec::new(),
         coverage_log: Mutex::new(File::create("coverage.txt")
             .expect("Failed to create coverage file")),
+        lighthouse_log: Mutex::new(File::create("lighthouse.txt")
+            .expect("Failed to create lighthouse coverage file")),
         compile_jobs: Default::default(),
         coverage_table: (0..32 * 1024 * 1024).map(|_| {
             (AtomicU64::new(COVERAGE_ENTRY_EMPTY), AtomicU64::new(0))
@@ -927,7 +962,7 @@ fn main() -> io::Result<()> {
     let _jit_cache = Arc::new(JitCache::new(VirtAddr(4 * 1024 * 1024)));
 
     // Create an emulator using the JIT
-    let emu = Emulator::new(8 * 1024 * 1024);
+    let emu = Emulator::new(64 * 1024 * 1024);
     let mut emu = if REPRO_MODE.is_some() {
         emu
     } else {
@@ -944,10 +979,9 @@ fn main() -> io::Result<()> {
     }
 
     // Load the ELF into the memory
-    load_elf("libtiff", &mut emu)?;
+    load_elf("/home/pleb/fuzz_xml/fuzzer/fuzzer.sym", &mut emu)?;
     
-    const FUZZ_START_SYM: &str =
-        "_Z8fuzz_onePKvmPNSt7__cxx1119basic_istringstreamIcSt11char_traitsIcESaIcEEE";
+    const FUZZ_START_SYM: &str = "fuzzme";
     
     // Register breakpoints
     emu.add_breakpoint(emu.resolve_symbol("_malloc_r").unwrap(), malloc_bp);
@@ -957,9 +991,9 @@ fn main() -> io::Result<()> {
     emu.add_breakpoint(emu.resolve_symbol(FUZZ_START_SYM).unwrap(), snapshot);
 
     // Set up a stack
-    let stack = emu.memory.allocate(32 * 1024)
+    let stack = emu.memory.allocate(1024 * 1024)
         .expect("Failed to allocate stack");
-    emu.set_reg(Register::Sp, stack.0 as u64 + 32 * 1024);
+    emu.set_reg(Register::Sp, stack.0 as u64 + 1024 * 1024);
 
     // Set up the program name
     let progname = emu.memory.allocate(4096)
@@ -1071,8 +1105,11 @@ fn main() -> io::Result<()> {
                            resetc, vmc);
 
                     for (vmexit, &freq) in stats.vmexits.iter() {
-                        print!("{:15} [{:8.6}] {:x?}\n",
-                               freq, freq as f64 / fuzz_cases as f64, vmexit);
+                        if freq as f64 / fuzz_cases as f64 > 0.01 {
+                            print!("{:15} [{:8.6}] {:x?}\n",
+                                   freq, freq as f64 / fuzz_cases as f64,
+                                   vmexit);
+                        }
                     }
 
                     last_time = Instant::now();
@@ -1085,7 +1122,7 @@ fn main() -> io::Result<()> {
     let num_cores = if REPRO_MODE.is_some() {
         1
     } else {
-        1
+        192
     };
 
     for thr_id in 0..num_cores {
